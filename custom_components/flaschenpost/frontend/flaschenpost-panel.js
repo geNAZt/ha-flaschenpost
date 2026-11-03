@@ -801,10 +801,9 @@ class FlaschenpostView extends HTMLElement {
         .map((lname) => {
           const count = (this._lists[lname] || []).filter((i) => !i.completed).length;
           const activeCls = lname === this._activeList ? "active" : "";
+          const lcfg = (this._listConfigs && this._listConfigs[lname]) || {};
+          const rndBadge = lcfg.random_enabled ? ` 🎲${lcfg.random_count || 1}` : "";
           return `
-            const lcfg = (this._listConfigs && this._listConfigs[lname]) || {};
-            const rndBadge = lcfg.random_enabled ? ` 🎲${lcfg.random_count || 1}` : "";
-            return `
             <button class="tab-btn ${activeCls}" data-list-name="${lname}">
               ${lname} (${count}${rndBadge})
             </button>
