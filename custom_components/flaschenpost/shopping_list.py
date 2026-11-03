@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .api import FlaschenpostApiClient
+from .api import FlaschenpostApiClient, extract_negative_keywords
 from .const import (
     DEFAULT_SHOPPING_LIST_NAME,
     ORIGIN_FAVORITES,
@@ -90,6 +90,7 @@ class ParsedShoppingSpec:
     display_unit: str = "x"
     explicit_article_id: int | None = None
     sort_by: str | None = None
+    negative_keywords: list[str] = field(default_factory=list)
 
 
 def resolve_sort_alias(raw: str | None) -> str | None:
@@ -165,6 +166,7 @@ def format_base_amount(unit_type: str, amount_base: float) -> str:
 def format_shopping_spec_summary(spec: ParsedShoppingSpec) -> str:
     """Format a `ParsedShoppingSpec` into a clean canonical summary."""
     suffix = f" #{spec.explicit_article_id}" if spec.explicit_article_id is not None else ""
+    neg_suffix = "".join(f" !{kw}" for kw in spec.negative_keywords)
     sort_tag = ""
     if spec.sort_by:
         reverse_tag = {
@@ -182,10 +184,10 @@ def format_shopping_spec_summary(spec: ParsedShoppingSpec) -> str:
     if spec.unit_type == UNIT_TYPE_UNIT:
         qty = max(1, round(spec.target_amount_base))
         prefix = f"{qty}x " if qty > 1 else ""
-        return f"{prefix}{core_name}{sort_tag}{suffix}"
+        return f"{prefix}{core_name}{neg_suffix}{sort_tag}{suffix}"
 
     amt_prefix = format_base_amount(spec.unit_type, spec.target_amount_base)
-    return f"{amt_prefix} {core_name}{sort_tag}{suffix}"
+    return f"{amt_prefix} {core_name}{neg_suffix}{sort_tag}{suffix}"
 
 
 def parse_shopping_item_spec(summary: str) -> ParsedShoppingSpec:
@@ -196,8 +198,10 @@ def parse_shopping_item_spec(summary: str) -> ParsedShoppingSpec:
       - `'1kg Naturjoghurt'` -> weight_g=1000, query='Naturjoghurt'
       - `'1,5kg Puten Schnitzel'` -> weight_g=1500, query='Puten Schnitzel'
       - `'1 Kiste Pepsi Zero'` -> crate=1, query='Pepsi Zero'
+      - `'Heidelbeeren !zucker'` -> query='Heidelbeeren', negative_keywords=['zucker']
     """
     cleaned, sort_hint = extract_inline_sort_hint(summary.strip())
+    cleaned, neg_kws = extract_negative_keywords(cleaned)
 
     explicit_aid: int | None = None
     aid_match = _TRAILING_AID_REGEX.search(cleaned)
@@ -221,6 +225,7 @@ def parse_shopping_item_spec(summary: str) -> ParsedShoppingSpec:
                 display_unit="kg",
                 explicit_article_id=explicit_aid,
                 sort_by=sort_hint,
+                negative_keywords=neg_kws,
             )
         if raw_unit in ("g", "gr", "gramm"):
             return ParsedShoppingSpec(
@@ -232,6 +237,7 @@ def parse_shopping_item_spec(summary: str) -> ParsedShoppingSpec:
                 display_unit="g",
                 explicit_article_id=explicit_aid,
                 sort_by=sort_hint,
+                negative_keywords=neg_kws,
             )
         if raw_unit in ("l", "ltr", "liter"):
             return ParsedShoppingSpec(
@@ -243,6 +249,7 @@ def parse_shopping_item_spec(summary: str) -> ParsedShoppingSpec:
                 display_unit="L",
                 explicit_article_id=explicit_aid,
                 sort_by=sort_hint,
+                negative_keywords=neg_kws,
             )
         if raw_unit in ("ml", "milliliter"):
             return ParsedShoppingSpec(
@@ -254,6 +261,7 @@ def parse_shopping_item_spec(summary: str) -> ParsedShoppingSpec:
                 display_unit="ml",
                 explicit_article_id=explicit_aid,
                 sort_by=sort_hint,
+                negative_keywords=neg_kws,
             )
         if raw_unit in (
             "kiste",
@@ -273,6 +281,7 @@ def parse_shopping_item_spec(summary: str) -> ParsedShoppingSpec:
                 display_unit="Kiste",
                 explicit_article_id=explicit_aid,
                 sort_by=sort_hint,
+                negative_keywords=neg_kws,
             )
 
         return ParsedShoppingSpec(
@@ -284,6 +293,7 @@ def parse_shopping_item_spec(summary: str) -> ParsedShoppingSpec:
             display_unit="x",
             explicit_article_id=explicit_aid,
             sort_by=sort_hint,
+            negative_keywords=neg_kws,
         )
 
     bare_match = _BARE_COUNT_REGEX.match(cleaned)
@@ -299,6 +309,7 @@ def parse_shopping_item_spec(summary: str) -> ParsedShoppingSpec:
             display_unit="x",
             explicit_article_id=explicit_aid,
             sort_by=sort_hint,
+            negative_keywords=neg_kws,
         )
 
     # Also support "Reis & Getreide::500g Milchreis" (category prefix before amount)
@@ -310,6 +321,8 @@ def parse_shopping_item_spec(summary: str) -> ParsedShoppingSpec:
             inner.explicit_article_id = explicit_aid
         if sort_hint is not None and inner.sort_by is None:
             inner.sort_by = sort_hint
+        if neg_kws:
+            inner.negative_keywords = list(dict.fromkeys(inner.negative_keywords + neg_kws))
         return inner
 
     return ParsedShoppingSpec(
@@ -321,6 +334,7 @@ def parse_shopping_item_spec(summary: str) -> ParsedShoppingSpec:
         display_unit="x",
         explicit_article_id=explicit_aid,
         sort_by=sort_hint,
+        negative_keywords=neg_kws,
     )
 
 
@@ -337,16 +351,20 @@ def build_preview_spec(
     if amount_prefix and amount_prefix.strip():
         amt_str = amount_prefix.strip()
         # Strip any existing amount from raw_query by applying amt_str to the extracted core name
+        neg_suffix = "".join(f" !{kw}" for kw in base_spec.negative_keywords)
         core = (
             f"{base_spec.category}::{base_spec.query}"
             if base_spec.category
             else base_spec.query
         )
-        combined = parse_shopping_item_spec(f"{amt_str} {core}")
+        combined = parse_shopping_item_spec(f"{amt_str} {core}{neg_suffix}")
         if base_spec.explicit_article_id is not None:
             combined.explicit_article_id = base_spec.explicit_article_id
         if base_spec.sort_by is not None:
             combined.sort_by = base_spec.sort_by
+        combined.negative_keywords = list(
+            dict.fromkeys(base_spec.negative_keywords + combined.negative_keywords)
+        )
         base_spec = combined
 
     if category_override and category_override.strip():
@@ -461,6 +479,7 @@ class ShoppingListItem:
     quantity: int = 1
     article_id: int | None = None
     sort_by: str | None = None
+    negative_keywords: list[str] = field(default_factory=list)
     last_resolved_note: str | None = None
     completed: bool = False
 
@@ -481,6 +500,12 @@ class ShoppingListItem:
         else:
             target_base = spec.target_amount_base
 
+        raw_negs = data.get("negative_keywords")
+        if isinstance(raw_negs, list):
+            negs = [str(k) for k in raw_negs]
+        else:
+            negs = list(spec.negative_keywords)
+
         explicit_aid = spec.explicit_article_id
         return cls(
             uid=str(data.get("uid") or uuid.uuid4()),
@@ -492,6 +517,7 @@ class ShoppingListItem:
             quantity=int(data.get("quantity") or max(1, round(target_base))),
             article_id=explicit_aid,
             sort_by=data.get("sort_by") or spec.sort_by,
+            negative_keywords=negs,
             last_resolved_note=data.get("last_resolved_note"),
             completed=bool(data.get("completed", False)),
         )
@@ -507,6 +533,7 @@ class _MergedRequirement:
     target_amount_base: float
     explicit_article_id: int | None
     sort_by: str | None
+    negative_keywords: list[str] = field(default_factory=list)
     source_lists: list[str] = field(default_factory=list)
     source_items: list[ShoppingListItem] = field(default_factory=list)
 
@@ -662,6 +689,7 @@ class FlaschenpostShoppingListManager:
             quantity=qty_display,
             article_id=spec.explicit_article_id,
             sort_by=effective_sort,
+            negative_keywords=spec.negative_keywords,
             completed=False,
         )
 
@@ -741,6 +769,7 @@ class FlaschenpostShoppingListManager:
             target.quantity = rebuilt.quantity
             target.article_id = rebuilt.article_id
             target.sort_by = rebuilt.sort_by
+            target.negative_keywords = rebuilt.negative_keywords
             target.last_resolved_note = None
 
         if completed is not None:
@@ -821,6 +850,7 @@ class FlaschenpostShoppingListManager:
             target_amount_base=spec.target_amount_base,
             article_id=spec.explicit_article_id,
             sort_by=spec.sort_by,
+            negative_keywords=spec.negative_keywords,
         )
 
         effective_sort = spec.sort_by or SORT_PRICE
@@ -839,6 +869,7 @@ class FlaschenpostShoppingListManager:
                 sort_by=search_sort,
                 only_available=False,
                 only_crates=(spec.unit_type == UNIT_TYPE_CRATE),
+                negative_keywords=spec.negative_keywords,
             )
 
         enriched_candidates: list[dict[str, Any]] = []
@@ -1040,6 +1071,7 @@ class FlaschenpostShoppingListManager:
                         item.unit_type,
                         item.article_id,
                         eff_sort,
+                        tuple(sorted([k.lower() for k in item.negative_keywords])),
                     )
                     if mkey not in merged_map:
                         merged_map[mkey] = _MergedRequirement(
@@ -1049,6 +1081,7 @@ class FlaschenpostShoppingListManager:
                             target_amount_base=item.target_amount_base,
                             explicit_article_id=item.article_id,
                             sort_by=eff_sort,
+                            negative_keywords=list(item.negative_keywords),
                             source_lists=[internal_key],
                             source_items=[item],
                         )
@@ -1073,6 +1106,7 @@ class FlaschenpostShoppingListManager:
                         temp_item.unit_type,
                         temp_item.article_id,
                         eff_sort,
+                        tuple(sorted([k.lower() for k in temp_item.negative_keywords])),
                     )
                     if mkey not in merged_map:
                         merged_map[mkey] = _MergedRequirement(
@@ -1082,6 +1116,7 @@ class FlaschenpostShoppingListManager:
                             target_amount_base=temp_item.target_amount_base,
                             explicit_article_id=temp_item.article_id,
                             sort_by=eff_sort,
+                            negative_keywords=list(temp_item.negative_keywords),
                             source_lists=[requested_name],
                         )
                     else:
@@ -1130,9 +1165,10 @@ class FlaschenpostShoppingListManager:
             core_label = (
                 f"{req.category}::{req.query}" if req.category else req.query
             )
+            neg_suffix = "".join(f" !{kw}" for kw in req.negative_keywords)
             req_label = (
                 f"{format_base_amount(req.unit_type, req.target_amount_base)} "
-                f"{core_label}"
+                f"{core_label}{neg_suffix}"
             )
             resolution = await self._client.async_resolve_item_for_cart(
                 req.query,
@@ -1141,6 +1177,7 @@ class FlaschenpostShoppingListManager:
                 target_amount_base=req.target_amount_base,
                 article_id=req.explicit_article_id,
                 sort_by=req.sort_by,
+                negative_keywords=req.negative_keywords,
             )
             if not resolution or resolution.get("article_id") is None:
                 unresolved.append(req_label)

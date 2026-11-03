@@ -36,12 +36,14 @@ from custom_components.flaschenpost.api import (
     FlaschenpostApiClient,
     cents_to_eur,
     compute_basket_class,
+    extract_negative_keywords,
     extract_product_categories,
     extract_product_summary,
     matches_category_filter,
     matches_query_qualifiers,
     normalize_search_queries,
     parse_price_per_unit_text,
+    product_matches_negative_keywords,
 )
 from custom_components.flaschenpost.const import (
     CONF_DELIVERY_LOCATION,
@@ -57,6 +59,7 @@ from custom_components.flaschenpost.const import (
 )
 from custom_components.flaschenpost.shopping_list import (
     FlaschenpostShoppingListManager,
+    ShoppingListItem,
     build_pinned_spec_summary,
     build_preview_spec,
     estimate_candidate_pack_plan,
@@ -124,6 +127,39 @@ class _FakeApiClient:
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
         ql = query.lower()
+        if "heidelbeeren" in ql:
+            cand_29010 = {
+                "article_id": 29010,
+                "name": "K-Classic Heidelbeeren gezuckert",
+                "description": "540g",
+                "package_weight_g": 540.0,
+                "price_eur": 2.29,
+                "price_per_kg_eur": 4.24,
+                "is_available": True,
+                "categories": ["Obst- & Gemüsekonserven", "Beeren"],
+                "category_slugs": ["obst-gemuesekonserven", "beeren"],
+            }
+            cand_32672 = {
+                "article_id": 32672,
+                "name": "K-Classic Heidelbeeren",
+                "description": "750g",
+                "package_weight_g": 750.0,
+                "price_eur": 4.89,
+                "price_per_kg_eur": 6.52,
+                "is_available": True,
+                "categories": ["Tiefkühl", "Obst"],
+                "category_slugs": ["tiefkuehl", "obst"],
+            }
+            res = [cand_29010, cand_32672]
+            _clean_q, extracted_neg = extract_negative_keywords(query)
+            eff_neg = list(
+                dict.fromkeys(
+                    [k.lower() for k in (kwargs.get("negative_keywords") or []) + extracted_neg]
+                )
+            )
+            if eff_neg:
+                res = [c for c in res if not product_matches_negative_keywords(c, eff_neg)]
+            return res[:limit]
         if "joghurt" in ql:
             cand_28249 = {
                 "article_id": 28249,
@@ -190,9 +226,54 @@ class _FakeApiClient:
         category: str | None = None,
         sort_by: str | None = None,
         name_contains: str | None = None,
+        negative_keywords: list[str] | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any] | None:
         self.resolve_calls.append((query, category, unit_type, target_amount_base))
         ql = query.lower()
+        if "heidelbeeren" in ql:
+            __clean_q, extracted_neg = extract_negative_keywords(query)
+            eff_neg = list(
+                dict.fromkeys(
+                    [k.lower() for k in (negative_keywords or []) + extracted_neg]
+                )
+            )
+            has_zucker_neg = any("zucker" in k for k in eff_neg)
+            if has_zucker_neg:
+                return {
+                    "article_id": 32672,
+                    "quantity": 1,
+                    "unit_type": unit_type,
+                    "requested_amount_base": target_amount_base,
+                    "delivered_amount_base": 750.0,
+                    "line_total_eur": 4.89,
+                    "product": {
+                        "article_id": 32672,
+                        "name": "K-Classic Heidelbeeren",
+                        "description": "750g",
+                        "package_weight_g": 750.0,
+                        "categories": ["Tiefkühl", "Obst"],
+                        "price_eur": 4.89,
+                        "price_per_kg_eur": 6.52,
+                    },
+                }
+            return {
+                "article_id": 29010,
+                "quantity": 1,
+                "unit_type": unit_type,
+                "requested_amount_base": target_amount_base,
+                "delivered_amount_base": 540.0,
+                "line_total_eur": 2.29,
+                "product": {
+                    "article_id": 29010,
+                    "name": "K-Classic Heidelbeeren gezuckert",
+                    "description": "540g",
+                    "package_weight_g": 540.0,
+                    "categories": ["Obst- & Gemüsekonserven", "Beeren"],
+                    "price_eur": 2.29,
+                    "price_per_kg_eur": 4.24,
+                },
+            }
         if "milchreis" in ql:
             if category and "reis & getreide" in category.lower():
                 # Dry pudding rice from "Kochen & Vorrat -> Reis & Getreide"
@@ -1169,6 +1250,143 @@ class TestFlaschenpostHelpers(unittest.TestCase):
                 self.assertEqual(res_kg["line_total_eur"], 1.78)
 
             asyncio.run(_run())
+
+
+    def test_negative_keywords_filtering_and_resolution(self) -> None:
+        """Verify negative keyword extraction, candidate filtering, and cart resolution.
+
+        Specifically 'Heidelbeeren !zucker' should match 'K-Classic Heidelbeeren' (#32672)
+        and exclude 'K-Classic Heidelbeeren gezuckert' (#29010).
+        """
+        # 1. Negative keyword extraction
+        cleaned, negs = extract_negative_keywords("Heidelbeeren !zucker")
+        self.assertEqual(cleaned, "Heidelbeeren")
+        self.assertEqual(negs, ["zucker"])
+
+        cleaned2, negs2 = extract_negative_keywords("500g Heidelbeeren !zucker !bio")
+        self.assertEqual(cleaned2, "500g Heidelbeeren")
+        self.assertEqual(negs2, ["zucker", "bio"])
+
+        cleaned3, negs3 = extract_negative_keywords("Obst & Gemüse::Heidelbeeren !zucker")
+        self.assertEqual(cleaned3, "Obst & Gemüse::Heidelbeeren")
+        self.assertEqual(negs3, ["zucker"])
+
+        cleaned4, negs4 = extract_negative_keywords("Heidelbeeren -zucker")
+        self.assertEqual(cleaned4, "Heidelbeeren")
+        self.assertEqual(negs4, ["zucker"])
+
+        # 2. Spec parsing and summary formatting
+        spec = parse_shopping_item_spec("Heidelbeeren !zucker")
+        self.assertEqual(spec.query, "Heidelbeeren")
+        self.assertEqual(spec.negative_keywords, ["zucker"])
+        self.assertEqual(format_shopping_spec_summary(spec), "Heidelbeeren !zucker")
+
+        spec_kg = parse_shopping_item_spec("500g Heidelbeeren !zucker")
+        self.assertEqual(spec_kg.query, "Heidelbeeren")
+        self.assertEqual(spec_kg.negative_keywords, ["zucker"])
+        self.assertEqual(format_shopping_spec_summary(spec_kg), "500g Heidelbeeren !zucker")
+
+        # 3. Product negative keywords matching
+        cand_gezuckert = {
+            "name": "K-Classic Heidelbeeren gezuckert",
+            "description": "540g",
+            "categories": ["Obst- & Gemüsekonserven", "Beeren"],
+        }
+        cand_pure = {
+            "name": "K-Classic Heidelbeeren",
+            "description": "750g",
+            "categories": ["Tiefkühl", "Obst"],
+        }
+        self.assertTrue(product_matches_negative_keywords(cand_gezuckert, ["zucker"]))
+        self.assertFalse(product_matches_negative_keywords(cand_pure, ["zucker"]))
+
+        async def _run() -> None:
+            fake_client = _FakeApiClient()
+            mgr = FlaschenpostShoppingListManager(client=fake_client)  # type: ignore[arg-type]
+
+            # Without negative keyword: #29010 ("gezuckert") is cheaper (2.29 EUR vs 4.89 EUR) and wins
+            preview_unfiltered = await mgr.async_preview_search("Heidelbeeren")
+            self.assertIsNotNone(preview_unfiltered["winner"])
+            self.assertEqual(preview_unfiltered["winner"]["article_id"], 29010)
+
+            # With negative keyword "!zucker": #29010 is excluded, #32672 wins!
+            preview_filtered = await mgr.async_preview_search("Heidelbeeren !zucker")
+            self.assertIsNotNone(preview_filtered["winner"])
+            self.assertEqual(preview_filtered["winner"]["article_id"], 32672)
+            cand_ids = [c["article_id"] for c in preview_filtered["candidates"]]
+            self.assertIn(32672, cand_ids)
+            self.assertNotIn(29010, cand_ids)
+
+            # Test real FlaschenpostApiClient search filtering logic
+            real_client = FlaschenpostApiClient(email="test@example.com", password="pass")
+
+            real_client.async_get_cart = lambda: asyncio.sleep(0, result={"id": "cart-1"})  # type: ignore[assignment]
+            real_client._warehouse_id = 123
+            real_client._client_ready = asyncio.Event()
+            real_client._client_ready.set()
+
+            async def _fake_request(method: str, path: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+                return {
+                    "results": [
+                        {
+                            "id": "p-29010",
+                            "name": {"de": "K-Classic Heidelbeeren gezuckert"},
+                            "categories": [{"obj": {"name": {"de": "Obst- & Gemüsekonserven"}}}],
+                            "masterVariant": {
+                                "sku": "29010",
+                                "prices": [{"value": {"centAmount": 229}}],
+                                "attributes": [
+                                    {"name": "PriceFields", "value": '{"Price": 229, "BasePrice": "4,24 € / kg", "ArticleStatus": "A"}'},
+                                    {"name": "ShortDescription", "value": "540g"},
+                                ],
+                            },
+                        },
+                        {
+                            "id": "p-32672",
+                            "name": {"de": "K-Classic Heidelbeeren"},
+                            "categories": [{"obj": {"name": {"de": "Tiefkühl"}}}],
+                            "masterVariant": {
+                                "sku": "32672",
+                                "prices": [{"value": {"centAmount": 489}}],
+                                "attributes": [
+                                    {"name": "PriceFields", "value": '{"Price": 489, "BasePrice": "6,52 € / kg", "ArticleStatus": "A"}'},
+                                    {"name": "ShortDescription", "value": "750g"},
+                                ],
+                            },
+                        },
+                    ]
+                }
+            real_client._request = _fake_request  # type: ignore[assignment]
+
+            filtered_search = await real_client.async_search_products(
+                "Heidelbeeren !zucker",
+                only_available=False,
+            )
+            filtered_ids = [c["article_id"] for c in filtered_search]
+            self.assertEqual(filtered_ids, [32672])
+
+            resolved_winner = await real_client.async_resolve_item_for_cart("Heidelbeeren !zucker")
+            self.assertIsNotNone(resolved_winner)
+            self.assertEqual(resolved_winner["article_id"], 32672)
+            await real_client.async_close()
+
+            # Test shopping list persistence and round-trip
+            item = mgr._build_lazy_item("Heidelbeeren !zucker")
+            self.assertEqual(item.query, "Heidelbeeren")
+            self.assertEqual(item.negative_keywords, ["zucker"])
+            serialized = item.to_dict()
+            self.assertEqual(serialized["negative_keywords"], ["zucker"])
+            deserialized = ShoppingListItem.from_dict(serialized)
+            self.assertEqual(deserialized.negative_keywords, ["zucker"])
+            self.assertEqual(deserialized.query, "Heidelbeeren")
+
+            # Test list merge & cart resolution
+            await mgr.async_add_item("Heidelbeeren !zucker")
+            add_res = await mgr.async_add_lists_to_cart()
+            self.assertEqual(add_res["synced_count"], 1)
+            self.assertEqual(add_res["resolved_items"][0]["article_id"], 32672)
+
+        asyncio.run(_run())
 
 if __name__ == "__main__":
     unittest.main()

@@ -485,6 +485,57 @@ def _word_matches_haystack(
     return False
 
 
+_NEGATIVE_KEYWORD_REGEX = re.compile(
+    r"(?:^|\s)(?:!|-(?=[A-Za-zÄÖÜäöüß]))\s*(?P<kw>[A-Za-zÄÖÜäöüß0-9_]+)(?=\s|$)"
+)
+
+
+def extract_negative_keywords(text: str) -> tuple[str, list[str]]:
+    """Extract negative keywords starting with `!` from a query or line item.
+
+    Examples:
+      - 'Heidelbeeren !zucker' -> ('Heidelbeeren', ['zucker'])
+      - '500g Heidelbeeren !zucker !bio' -> ('500g Heidelbeeren', ['zucker', 'bio'])
+    """
+    negatives: list[str] = []
+
+    def _replace(m: re.Match[str]) -> str:
+        kw = m.group("kw").strip()
+        if kw and kw.lower() not in [k.lower() for k in negatives]:
+            negatives.append(kw)
+        return " "
+
+    cleaned = _NEGATIVE_KEYWORD_REGEX.sub(_replace, text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned, negatives
+
+
+def product_matches_negative_keywords(
+    product: dict[str, Any], negative_keywords: list[str]
+) -> bool:
+    """Check if product text contains any of the negative keywords (case-insensitive)."""
+    if not negative_keywords:
+        return False
+
+    haystack_parts = [
+        str(product.get("name") or ""),
+        str(product.get("description") or ""),
+        str(product.get("ingredients") or ""),
+    ]
+    for cat in product.get("categories") or []:
+        haystack_parts.append(str(cat))
+
+    haystack = " ".join(haystack_parts).lower()
+
+    for kw in negative_keywords:
+        kw_clean = kw.strip().lower()
+        if not kw_clean:
+            continue
+        if kw_clean in haystack:
+            return True
+    return False
+
+
 def matches_query_qualifiers(item: dict[str, Any], query: str) -> bool:
     """Verify explicit percentage/word tokens in `query` match candidate text."""
     title_haystack = " ".join(
@@ -1169,8 +1220,16 @@ class FlaschenpostApiClient:
         max_price_per_liter_eur: float | None = None,
         only_available: bool = True,
         only_crates: bool = False,
+        negative_keywords: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Search products in customer's local warehouse with category, unit/kg/L, and crate filtering."""
+        clean_query, extracted_neg = extract_negative_keywords(query)
+        effective_neg: list[str] = list(
+            dict.fromkeys(
+                [k.strip().lower() for k in (negative_keywords or []) + extracted_neg if k.strip()]
+            )
+        )
+
         wh_id = warehouse_id or self._warehouse_id
         if not wh_id:
             await self.async_get_cart()
@@ -1200,7 +1259,7 @@ class FlaschenpostApiClient:
                                     seen_ids.add(aid)
                                     candidates.append(summary)
 
-        queries = normalize_search_queries(query)
+        queries = normalize_search_queries(clean_query or query)
         fetch_size = (
             50
             if sort_by != SORT_RELEVANCE or name_contains or only_crates or category
@@ -1219,6 +1278,14 @@ class FlaschenpostApiClient:
                     if aid not in seen_ids:
                         seen_ids.add(aid)
                         candidates.append(summary)
+
+        # Negative keywords filter (e.g. "!zucker", "!bio")
+        if effective_neg:
+            candidates = [
+                c
+                for c in candidates
+                if not product_matches_negative_keywords(c, effective_neg)
+            ]
 
         # 1. Category filter (enforced strictly when specified)
         if category and category.strip():
@@ -1245,10 +1312,10 @@ class FlaschenpostApiClient:
             # When an explicit category was given, require query words to match
             # instead of falling back to unrelated items in that category
             candidates = [
-                c for c in candidates if matches_query_qualifiers(c, query)
+                c for c in candidates if matches_query_qualifiers(c, clean_query or query)
             ]
         else:
-            strict = [c for c in candidates if matches_query_qualifiers(c, query)]
+            strict = [c for c in candidates if matches_query_qualifiers(c, clean_query or query)]
             if strict:
                 candidates = strict
 
@@ -1329,8 +1396,16 @@ class FlaschenpostApiClient:
         article_id: int | None = None,
         sort_by: str | None = None,
         name_contains: str | None = None,
+        negative_keywords: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """Lazily resolve a shopping list requirement against live warehouse stock, category, and prices."""
+        clean_query, extracted_neg = extract_negative_keywords(query)
+        effective_neg: list[str] = list(
+            dict.fromkeys(
+                [k.strip().lower() for k in (negative_keywords or []) + extracted_neg if k.strip()]
+            )
+        )
+
         if article_id is not None:
             cards = await self.async_get_products_by_article_ids([article_id])
             chosen = cards[0] if cards else {"article_id": article_id, "name": query}
@@ -1364,12 +1439,13 @@ class FlaschenpostApiClient:
                 else SORT_PRICE
             )
             pool = await self.async_search_products(
-                query,
+                clean_query or query,
                 limit=50,
                 category=category,
                 name_contains=name_contains,
                 sort_by=search_sort,
                 only_available=True,
+                negative_keywords=effective_neg,
             )
             weighted = [
                 c
@@ -1445,12 +1521,13 @@ class FlaschenpostApiClient:
                 else SORT_PRICE
             )
             pool = await self.async_search_products(
-                query,
+                clean_query or query,
                 limit=50,
                 category=category,
                 name_contains=name_contains,
                 sort_by=search_sort,
                 only_available=True,
+                negative_keywords=effective_neg,
             )
             volumetric = [
                 c
@@ -1527,13 +1604,14 @@ class FlaschenpostApiClient:
                 else SORT_PRICE
             )
             pool = await self.async_search_products(
-                query,
+                clean_query or query,
                 limit=25,
                 category=category,
                 name_contains=name_contains,
                 sort_by=search_sort,
                 only_available=True,
                 only_crates=True,
+                negative_keywords=effective_neg,
             )
             if not pool:
                 return None
@@ -1568,12 +1646,13 @@ class FlaschenpostApiClient:
 
         effective_sort = sort_by or SORT_PRICE
         pool = await self.async_search_products(
-            query,
+            clean_query or query,
             limit=25,
             category=category,
             name_contains=name_contains,
             sort_by=effective_sort,
             only_available=True,
+            negative_keywords=effective_neg,
         )
         if not pool:
             return None
