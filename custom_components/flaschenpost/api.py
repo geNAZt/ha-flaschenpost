@@ -580,8 +580,20 @@ def extract_variant_summary(
     images = variant.get("images") or []
     image_url = images[0].get("url") if images else None
 
+    slug_map = product.get("slug") or {}
+    slug = (
+        slug_map.get("de-DE") or next(iter(slug_map.values()), "")
+        if isinstance(slug_map, dict)
+        else str(slug_map or "")
+    ).strip()
+    if not slug and name:
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    product_url = f"https://www.flaschenpost.de/p/{slug}" if slug else "https://www.flaschenpost.de"
+
     return {
         "article_id": article_id,
+        "slug": slug,
+        "product_url": product_url,
         "product_id": product.get("id"),
         "name": name,
         "brand": brand,
@@ -1638,6 +1650,8 @@ class FlaschenpostApiClient:
 
             return {
                 "article_id": int(article_id),
+                "slug": chosen.get("slug"),
+                "product_url": chosen.get("product_url"),
                 "quantity": qty,
                 "unit_type": unit_type,
                 "requested_amount_base": target_amount_base,
@@ -1721,6 +1735,8 @@ class FlaschenpostApiClient:
             delivered = round(_actual_w(winner), 1)
             return {
                 "article_id": int(winner["article_id"]),
+                "slug": winner.get("slug"),
+                "product_url": winner.get("product_url"),
                 "quantity": qty,
                 "unit_type": unit_type,
                 "requested_amount_base": target_amount_base,
@@ -1805,6 +1821,8 @@ class FlaschenpostApiClient:
             delivered = round(_actual_v(winner), 1)
             return {
                 "article_id": int(winner["article_id"]),
+                "slug": winner.get("slug"),
+                "product_url": winner.get("product_url"),
                 "quantity": qty,
                 "unit_type": unit_type,
                 "requested_amount_base": target_amount_base,
@@ -1859,6 +1877,8 @@ class FlaschenpostApiClient:
             qty, eff_price, line_total, tier_applied = _plan_c(winner)
             return {
                 "article_id": int(winner["article_id"]),
+                "slug": winner.get("slug"),
+                "product_url": winner.get("product_url"),
                 "quantity": qty,
                 "unit_type": unit_type,
                 "requested_amount_base": target_amount_base,
@@ -1905,6 +1925,8 @@ class FlaschenpostApiClient:
         qty, eff_price, line_total, tier_applied = _plan_u(winner)
         return {
             "article_id": int(winner["article_id"]),
+            "slug": winner.get("slug"),
+            "product_url": winner.get("product_url"),
             "quantity": qty,
             "unit_type": unit_type,
             "requested_amount_base": target_amount_base,

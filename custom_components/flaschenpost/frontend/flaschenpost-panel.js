@@ -1,7 +1,7 @@
 /**
  * Flaschenpost Interactive Shopping List Panel & Lovelace Card
  * Custom Web Component for Home Assistant
- * Version: 2.0.1
+ * Version: 2.0.3
  */
 
 class FlaschenpostView extends HTMLElement {
@@ -572,7 +572,7 @@ class FlaschenpostView extends HTMLElement {
             ${activeCat ? `<span class="badge-cat-sm">📁 ${activeCat}</span>` : ""}
           </div>
           <div style="font-weight: 700; font-size: 1.05rem; margin-top: 4px;">
-            ${w.quantity}x ${w.product.name} (#${w.article_id})
+            ${w.quantity}x ${w.product ? w.product.name : ""} (<a href="${w.product_url || (w.product && w.product.product_url) || (w.slug ? `https://www.flaschenpost.de/p/${w.slug}` : (w.product && w.product.slug ? `https://www.flaschenpost.de/p/${w.product.slug}` : `https://www.flaschenpost.de/p/${w.article_id}`))}" target="_blank" rel="noopener noreferrer" class="sku-link" title="Auf flaschenpost.de öffnen">#${w.article_id} ↗</a>)
           </div>
           <div style="font-size: 0.88rem; color: #555; margin-top: 2px;">
             Geliefert: <strong>${w.delivered_amount_base || ""}</strong> für <strong>${(w.line_total_eur || 0).toFixed(2)} €</strong>
@@ -610,7 +610,11 @@ class FlaschenpostView extends HTMLElement {
                   const candCats = (c.categories || []).slice(0, 2).join(" > ") || "—";
                   return `
                   <tr>
-                    <td><code>#${c.article_id}</code></td>
+                    <td>
+                      <a href="${c.product_url || (c.slug ? `https://www.flaschenpost.de/p/${c.slug}` : `https://www.flaschenpost.de/p/${c.article_id}`)}" target="_blank" rel="noopener noreferrer" class="sku-link" title="Auf flaschenpost.de öffnen">
+                        <code>#${c.article_id} ↗</code>
+                      </a>
+                    </td>
                     <td>
                       <strong>${c.name}</strong>
                       ${c.tier_applied ? `<span class="badge-mengenrabatt" title="Günstigerer Mengenrabatt greift">Mengenrabatt</span>` : ""}
@@ -975,7 +979,10 @@ class FlaschenpostView extends HTMLElement {
                       (r) => `
                     <tr>
                       <td><code>${r.requested}</code></td>
-                      <td><strong>${r.name}</strong><br /><span style="font-size:0.75rem; color:#888;">#${r.article_id}</span></td>
+                      <td>
+                        <strong>${r.name}</strong><br />
+                        <a href="${r.product_url || (r.slug ? `https://www.flaschenpost.de/p/${r.slug}` : `https://www.flaschenpost.de/p/${r.article_id}`)}" target="_blank" rel="noopener noreferrer" class="sku-link" style="font-size:0.75rem;" title="Auf flaschenpost.de öffnen">#${r.article_id} ↗</a>
+                      </td>
                       <td>${r.quantity_added}x (${r.delivered_amount})</td>
                       <td>${r.price_per_kg_eur ? `${Number(r.price_per_kg_eur).toFixed(2)} €/kg` : `${Number(r.unit_price_eur || 0).toFixed(2)} €`}</td>
                       <td><strong>${Number(r.line_total_eur || 0).toFixed(2)} €</strong></td>
@@ -1444,6 +1451,23 @@ class FlaschenpostView extends HTMLElement {
           padding: 8px 10px;
           border-top: 1px solid var(--divider-color, #eeeeee);
           vertical-align: middle;
+        }
+
+        .sku-link {
+          color: var(--primary-color, #e53935);
+          text-decoration: none;
+          font-weight: 700;
+          display: inline-flex;
+          align-items: center;
+          gap: 2px;
+        }
+        .sku-link:hover {
+          text-decoration: underline;
+          opacity: 0.85;
+        }
+        .sku-link code {
+          color: inherit;
+          cursor: pointer;
         }
 
         .badge-winner {

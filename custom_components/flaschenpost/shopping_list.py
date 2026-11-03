@@ -962,9 +962,11 @@ class FlaschenpostShoppingListManager:
             )
             wcats = " > ".join(wprod.get("categories") or []) or "—"
             wplan = estimate_candidate_pack_plan(spec, wprod)
+            w_url = winner.get("product_url") or wprod.get("product_url")
+            w_aid_txt = f"[`#{winner['article_id']}`]({w_url})" if w_url else f"`#{winner['article_id']}`"
             md_lines.append(
                 f"**Lazy Order-Time Winner:** `{winner['quantity']}x` **{wprod.get('name')}** "
-                f"(`{wprod.get('description') or w_deliv}`, `#{winner['article_id']}`) "
+                f"(`{wprod.get('description') or w_deliv}`, {w_aid_txt}) "
                 f"-> **{w_deliv}** for **{winner['line_total_eur']:.2f} EUR** "
                 f"({wplan['base_metric']}, Category: *{wcats}*)"
             )
@@ -987,8 +989,10 @@ class FlaschenpostShoppingListManager:
                     if aid == winner_aid and cand.get("is_available", True)
                     else ("In stock" if cand.get("is_available", True) else "Out of stock")
                 )
+                cand_url = cand.get("product_url")
+                sku_md = f"[`#{aid}`]({cand_url})" if cand_url else f"`#{aid}`"
                 md_lines.append(
-                    f"| `#{aid}` | {cand.get('name')} | {cats_txt} | {desc_txt} "
+                    f"| {sku_md} | {cand.get('name')} | {cats_txt} | {desc_txt} "
                     f"({float(cand.get('price_eur') or 0):.2f} EUR) | {cand['base_metric']} | "
                     f"`{cand['packs']}x` ({cand['delivered_amount']}) = **{cand['line_total_eur']:.2f} EUR** | {stock_txt} |"
                 )
@@ -1230,6 +1234,8 @@ class FlaschenpostShoppingListManager:
                     "category_filter": req.category,
                     "source_lists": req.source_lists,
                     "article_id": aid,
+                    "slug": prod.get("slug"),
+                    "product_url": prod.get("product_url"),
                     "name": prod.get("name"),
                     "categories": prod.get("categories"),
                     "pack_description": prod.get("description"),

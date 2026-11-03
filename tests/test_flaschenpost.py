@@ -713,6 +713,24 @@ class TestFlaschenpostHelpers(unittest.TestCase):
         self.assertTrue(matches_category_filter(meat_summary, "Fleisch"))
         # Filter "Fleisch & Fisch" matches both
         self.assertTrue(matches_category_filter(herta_summary, "Fleisch & Fisch"))
+
+        # Slug extraction and product URL generation
+        self.assertEqual(dry_summary["slug"], "oryza-milch-reis")
+        self.assertEqual(
+            dry_summary["product_url"],
+            "https://www.flaschenpost.de/p/oryza-milch-reis",
+        )
+        prod_with_explicit_slug = {
+            "name": {"de-DE": "K-Classic Heidelbeeren"},
+            "slug": {"de-DE": "k-classic-heidelbeeren-750g"},
+            "masterVariant": {"sku": "32672", "price": {"value": {"centAmount": 489}}},
+        }
+        summary_explicit = extract_product_summary(prod_with_explicit_slug)
+        self.assertEqual(summary_explicit["slug"], "k-classic-heidelbeeren-750g")
+        self.assertEqual(
+            summary_explicit["product_url"],
+            "https://www.flaschenpost.de/p/k-classic-heidelbeeren-750g",
+        )
         self.assertTrue(matches_category_filter(meat_summary, "Fleisch & Fisch"))
 
     def test_search_synonyms_and_qualifiers(self) -> None:
