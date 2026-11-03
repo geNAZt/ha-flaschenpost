@@ -1,0 +1,1947 @@
+"""Async API client for Flaschenpost B2C Webshop & Delivery services."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import re
+import time
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from urllib.parse import quote
+
+import aiohttp
+
+from .const import (
+    ADYEN_CLIENT_KEY,
+    ALL_PAYMENT_METHODS,
+    APP_USER_AGENT,
+    BASE_URL,
+    FRONTEND_VERSION,
+    ORIGIN_UNKNOWN,
+    PAYMENT_CREDIT_CARD,
+    PAYMENT_INVOICE,
+    PAYMENT_PAYPAL,
+    PAYMENT_SEPA,
+    RECOMMENDATIONS_APIM_KEY,
+    SLOTS_APIM_KEY,
+    SORT_PRICE,
+    SORT_PRICE_PER_KG,
+    SORT_PRICE_PER_LITER,
+    SORT_PRICE_PER_UNIT,
+    SORT_RELEVANCE,
+    UNIT_TYPE_CRATE,
+    UNIT_TYPE_UNIT,
+    UNIT_TYPE_VOLUME_ML,
+    UNIT_TYPE_WEIGHT_G,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+_PPU_REGEX = re.compile(
+    r"(?P<val>\d+(?:[.,]\d+)?)\s*€\s*/\s*(?P<scale>\d+\s*)?(?P<unit>kg|g|l|ml|stk|stck|stück)",
+    re.IGNORECASE,
+)
+_MULTIPACK_REGEX = re.compile(r"^\s*(?P<count>\d+)\s*[x×]\s*", re.IGNORECASE)
+_DESC_AMOUNT_REGEX = re.compile(
+    r"^\s*(?:(?P<count>\d+)\s*[x×]\s*)?(?P<val>\d+(?:[.,]\d+)?)\s*(?P<unit>kg|g|l|ml)\b",
+    re.IGNORECASE,
+)
+_QUERY_FILLER_WORDS = {"fett", "fettgehalt", "i.tr.", "ca."}
+_QUALIFIER_TOKEN_REGEX = re.compile(r"\d+(?:[.,]\d+)?\s*%")
+_DOUBLE_CONSONANT_REGEX = re.compile(r"([bcdfghjklmnpqrstvwxz])\1+")
+_CATEGORY_SPLIT_REGEX = re.compile(r"\s*(?:::|>|/)\s*")
+
+_SYNONYM_GROUPS: list[tuple[str, ...]] = [
+    ("zero", "ohne zucker", "zuckerfrei", "sugarfree"),
+    ("karotte", "karotten", "möhre", "möhren", "mohrrübe", "mohrrüben"),
+    ("kartoffel", "kartoffeln", "erdapfel", "erdäpfel"),
+    ("brötchen", "semmel", "semmeln", "schrippe", "schrippen"),
+]
+
+
+class FlaschenpostError(Exception):
+    """Base exception for Flaschenpost API errors."""
+
+
+class FlaschenpostAuthError(FlaschenpostError):
+    """Authentication or authorization error."""
+
+
+class FlaschenpostOrderError(FlaschenpostError):
+    """Checkout or ordering validation error."""
+
+
+def cents_to_eur(money: dict[str, Any] | None) -> float:
+    """Convert Commercetools centPrecision money object to EUR float."""
+    if not money or not isinstance(money, dict):
+        return 0.0
+    cents = money.get("centAmount", 0)
+    digits = money.get("fractionDigits", 2)
+    return round(float(cents) / (10**digits), digits)
+
+
+def compute_basket_class(total_goods_cents: int) -> str:
+    """Compute Flaschenpost slot basket class (`FP` in webshop bundle)."""
+    if total_goods_cents > 8000:
+        return "ABOVETHRESHOLD"
+    if total_goods_cents > 5000:
+        return "ABOVEMOV"
+    return "BELOWMOV"
+
+
+def parse_price_per_unit_text(
+    text: str | None,
+) -> tuple[float | None, str | None]:
+    """Parse Flaschenpost `PricePerUnitText` such as `(1,48 €/kg)` or `12 x 1L (0,71 €/l)`."""
+    if not text:
+        return None, None
+    match = _PPU_REGEX.search(text)
+    if not match:
+        return None, None
+
+    val = float(match.group("val").replace(",", "."))
+    scale_raw = (match.group("scale") or "").strip()
+    scale = float(scale_raw) if scale_raw else 1.0
+    unit = match.group("unit").lower()
+
+    if unit == "g":
+        return round(val * (1000.0 / scale), 4), "kg"
+    if unit == "kg":
+        return round(val / scale, 4), "kg"
+    if unit == "ml":
+        return round(val * (1000.0 / scale), 4), "l"
+    if unit == "l":
+        return round(val / scale, 4), "l"
+    return round(val / scale, 4), "unit"
+
+
+def parse_package_amount_from_description(
+    desc: str | None,
+) -> tuple[float | None, str | None]:
+    """Parse total package weight (g) or volume (ml) from `ArticleDescription` like `'4 x 150g'`."""
+    if not desc:
+        return None, None
+    match = _DESC_AMOUNT_REGEX.search(desc)
+    if not match:
+        return None, None
+    count = int(match.group("count")) if match.group("count") else 1
+    val = float(match.group("val").replace(",", "."))
+    unit = match.group("unit").lower()
+    total = count * val
+    if unit == "kg":
+        return round(total * 1000.0, 2), "g"
+    if unit == "g":
+        return round(total, 2), "g"
+    if unit == "l":
+        return round(total * 1000.0, 2), "ml"
+    if unit == "ml":
+        return round(total, 2), "ml"
+    return None, None
+
+
+def _collapse_double_consonants(text: str) -> str:
+    return _DOUBLE_CONSONANT_REGEX.sub(r"\1", text.lower())
+
+
+def _normalize_category_token(text: str) -> str:
+    """Normalize category name/slug for resilient matching (`'Reis & Getreide'` == `'reis-getreide'`)."""
+    lowered = text.strip().lower()
+    lowered = (
+        lowered.replace("ä", "ae")
+        .replace("ö", "oe")
+        .replace("ü", "ue")
+        .replace("ß", "ss")
+    )
+    lowered = re.sub(r"\s*(?:&|\+|und)\s*", " ", lowered)
+    lowered = re.sub(r"[^a-z0-9]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def _category_segment_matches(seg: str, cand: str) -> bool:
+    """Word-boundary category token match so `'reis'` matches `'reis getreide'` but NOT `'milchreis'`."""
+    if not seg or not cand:
+        return False
+    if seg == cand:
+        return True
+    cand_words = cand.split()
+    return all(tok in cand_words for tok in seg.split())
+
+
+def extract_product_categories(
+    product: dict[str, Any],
+) -> tuple[list[str], list[str], str | None]:
+    """Extract `(category_names, category_slugs, brand)` from Commercetools `categories`."""
+    cat_names: list[str] = []
+    cat_slugs: list[str] = []
+    brand: str | None = None
+
+    def _visit_cat_obj(obj: dict[str, Any] | None) -> None:
+        nonlocal brand
+        if not isinstance(obj, dict):
+            return
+        for anc in obj.get("ancestors") or []:
+            if isinstance(anc, dict) and isinstance(anc.get("obj"), dict):
+                _visit_cat_obj(anc["obj"])
+
+        ctype = (((obj.get("custom") or {}).get("type") or {}).get("key") or "").lower()
+        name_map = obj.get("name") or {}
+        cname = (
+            name_map.get("de-DE") or next(iter(name_map.values()), "")
+            if isinstance(name_map, dict)
+            else str(name_map)
+        ).strip()
+        slug_map = obj.get("slug") or {}
+        cslug = (
+            slug_map.get("de-DE") or next(iter(slug_map.values()), "")
+            if isinstance(slug_map, dict)
+            else str(slug_map)
+        ).strip()
+
+        if ctype == "fp-category-brand":
+            if cname and not brand:
+                brand = cname
+            return
+
+        if cname and cname not in cat_names:
+            cat_names.append(cname)
+        if cslug and cslug not in cat_slugs:
+            cat_slugs.append(cslug)
+
+    for entry in product.get("categories") or []:
+        if isinstance(entry, dict):
+            _visit_cat_obj(entry.get("obj") or entry)
+
+    return cat_names, cat_slugs, brand
+
+
+def matches_category_filter(item: dict[str, Any], category_filter: str | None) -> bool:
+    """Return True if candidate's category hierarchy satisfies `category_filter`.
+
+    Supports single categories (`'Reis & Getreide'`), slugs (`'reis-getreide'`),
+    and hierarchical paths (`'Kochen & Vorrat::Reis & Getreide'` or `'Kochen & Vorrat > Reis & Getreide'`).
+    """
+    if not category_filter or not category_filter.strip():
+        return True
+
+    segments = [
+        _normalize_category_token(seg)
+        for seg in _CATEGORY_SPLIT_REGEX.split(category_filter)
+        if _normalize_category_token(seg)
+    ]
+    if not segments:
+        return True
+
+    item_cats = item.get("categories") or []
+    item_slugs = item.get("category_slugs") or []
+    norm_pool = [
+        _normalize_category_token(str(x))
+        for x in (*item_cats, *item_slugs)
+        if str(x).strip()
+    ]
+    if not norm_pool:
+        return False
+
+    for seg in segments:
+        if not any(_category_segment_matches(seg, cand) for cand in norm_pool):
+            return False
+    return True
+
+
+def extract_variant_summary(
+    product: dict[str, Any], variant: dict[str, Any]
+) -> dict[str, Any]:
+    """Normalize a single Commercetools product variant with categories, €/unit, €/kg, €/L, weight, and crate info."""
+    sku = variant.get("sku") or product.get("key") or ""
+    try:
+        article_id: int | None = int(sku)
+    except (TypeError, ValueError):
+        article_id = None
+
+    name_obj = product.get("name") or {}
+    name = (
+        name_obj.get("de-DE")
+        or next(iter(name_obj.values()), "")
+        if isinstance(name_obj, dict)
+        else str(name_obj)
+    ).strip()
+    name = re.sub(r"\s{2,}", " ", name)
+
+    cat_names, cat_slugs, brand = extract_product_categories(product)
+
+    attrs = {
+        a.get("name"): a.get("value")
+        for a in (variant.get("attributes") or [])
+        if isinstance(a, dict) and a.get("name")
+    }
+
+    price_obj = variant.get("price") or {}
+    regular_price_eur = cents_to_eur(price_obj.get("value"))
+    disc_money = attrs.get("DiscountedPrice")
+    price_eur = (
+        cents_to_eur(disc_money)
+        if isinstance(disc_money, dict) and disc_money.get("centAmount") is not None
+        else regular_price_eur
+    )
+
+    price_fields = (price_obj.get("custom") or {}).get("fields") or {}
+    ppu_text = (
+        attrs.get("DiscountedPricePerUnitText")
+        or price_fields.get("PricePerUnitText")
+    )
+    base_price_eur, base_unit = parse_price_per_unit_text(ppu_text)
+
+    article_desc = str(attrs.get("ArticleDescription") or "").strip()
+    items_in_frame = int(attrs.get("ItemsInFrame") or 1)
+    mp_match = _MULTIPACK_REGEX.match(article_desc)
+    piece_count = (
+        int(mp_match.group("count"))
+        if mp_match and items_in_frame == 1
+        else max(1, items_in_frame)
+    )
+    price_per_unit_eur = (
+        round(price_eur / piece_count, 4) if price_eur > 0 else 0.0
+    )
+
+    # Compute exact package weight (g) or volume (ml)
+    vol = attrs.get("Volume")
+    vol_unit_raw = attrs.get("VolumeUnit")
+    vol_unit = (
+        vol_unit_raw.get("key")
+        if isinstance(vol_unit_raw, dict)
+        else str(vol_unit_raw or "")
+    ).lower()
+
+    package_weight_g: float | None = None
+    package_volume_ml: float | None = None
+    single_item_volume_ml: float = 0.0
+
+    if isinstance(vol, (int, float)) and vol > 0:
+        total_raw = float(vol) * (max(1, items_in_frame))
+        if vol_unit == "g":
+            package_weight_g = round(total_raw, 2)
+        elif vol_unit == "kg":
+            package_weight_g = round(total_raw * 1000.0, 2)
+        elif vol_unit == "ml":
+            package_volume_ml = round(total_raw, 2)
+            single_item_volume_ml = float(vol)
+        elif vol_unit == "l":
+            package_volume_ml = round(total_raw * 1000.0, 2)
+            single_item_volume_ml = float(vol) * 1000.0
+
+    desc_amount, desc_kind = parse_package_amount_from_description(article_desc)
+    if package_weight_g is None and desc_kind == "g":
+        package_weight_g = desc_amount
+    if package_volume_ml is None and desc_kind == "ml":
+        package_volume_ml = desc_amount
+        if piece_count > 0 and desc_amount:
+            single_item_volume_ml = desc_amount / piece_count
+
+    if base_price_eur is None and price_eur > 0:
+        if package_weight_g and package_weight_g > 0:
+            base_price_eur = round(price_eur / (package_weight_g / 1000.0), 4)
+            base_unit = "kg"
+        elif package_volume_ml and package_volume_ml > 0:
+            base_price_eur = round(price_eur / (package_volume_ml / 1000.0), 4)
+            base_unit = "l"
+
+    price_per_kg_eur = base_price_eur if base_unit == "kg" else None
+    price_per_liter_eur = base_price_eur if base_unit == "l" else None
+
+    if package_weight_g is None and price_per_kg_eur and price_per_kg_eur > 0 and price_eur > 0:
+        package_weight_g = round((price_eur / price_per_kg_eur) * 1000.0, 1)
+    if package_volume_ml is None and price_per_liter_eur and price_per_liter_eur > 0 and price_eur > 0:
+        package_volume_ml = round((price_eur / price_per_liter_eur) * 1000.0, 1)
+
+    container_raw = attrs.get("ContainerType")
+    container_type = (
+        container_raw.get("key")
+        if isinstance(container_raw, dict)
+        else (str(container_raw) if container_raw else None)
+    )
+    container_lower = (container_type or "").lower()
+    desc_lower = article_desc.lower()
+    is_can_or_grocery = (
+        "can" in container_lower
+        or "none" in container_lower
+        or "(dose)" in desc_lower
+    )
+    is_crate = (
+        not is_can_or_grocery
+        and (
+            items_in_frame >= 11
+            or (items_in_frame >= 6 and single_item_volume_ml >= 700.0)
+        )
+    )
+
+    is_available = attrs.get("IsAvailable")
+    if is_available is None:
+        is_available = price_fields.get("ArticleStatus", "A") == "A"
+
+    images = variant.get("images") or []
+    image_url = images[0].get("url") if images else None
+
+    return {
+        "article_id": article_id,
+        "product_id": product.get("id"),
+        "name": name,
+        "brand": brand,
+        "categories": cat_names,
+        "category_slugs": cat_slugs,
+        "description": article_desc or None,
+        "is_available": bool(is_available),
+        "price_eur": price_eur,
+        "regular_price_eur": regular_price_eur,
+        "items_in_frame": items_in_frame,
+        "piece_count": piece_count,
+        "package_weight_g": package_weight_g,
+        "package_volume_ml": package_volume_ml,
+        "container_type": container_type,
+        "is_crate": is_crate,
+        "price_per_unit_eur": price_per_unit_eur,
+        "price_per_kg_eur": price_per_kg_eur,
+        "price_per_liter_eur": price_per_liter_eur,
+        "base_price_eur": base_price_eur,
+        "base_unit": base_unit,
+        "price_per_unit": ppu_text,
+        "article_status": price_fields.get("ArticleStatus"),
+        "ingredients": attrs.get("Ingredients"),
+        "image_url": image_url,
+    }
+
+
+def extract_product_summary(product: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the masterVariant of a Commercetools product card."""
+    master = product.get("masterVariant") or {}
+    return extract_variant_summary(product, master)
+
+
+def extract_all_product_variants(product: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract normalized summaries for `masterVariant` and any additional `variants`."""
+    variants = []
+    if product.get("masterVariant"):
+        variants.append(product["masterVariant"])
+    variants.extend(product.get("variants") or [])
+    out = [extract_variant_summary(product, v) for v in variants]
+    return [s for s in out if s.get("article_id") is not None]
+
+
+def normalize_search_queries(query: str) -> list[str]:
+    """Generate primary, filler-stripped, and regional/brand synonym queries."""
+    cleaned = query.strip()
+    if not cleaned:
+        return []
+
+    out: list[str] = [cleaned]
+    tokens = [
+        t for t in re.split(r"\s+", cleaned) if t.lower() not in _QUERY_FILLER_WORDS
+    ]
+    stripped = " ".join(tokens).strip()
+    if stripped and stripped.lower() not in {q.lower() for q in out}:
+        out.append(stripped)
+
+    lower_q = cleaned.lower()
+    if "schwipp" in lower_q or "schwapp" in lower_q:
+        fixed_brand = re.sub(
+            r"schwipp", "Schwip", cleaned, flags=re.IGNORECASE
+        )
+        fixed_brand = re.sub(
+            r"schwapp", "Schwap", fixed_brand, flags=re.IGNORECASE
+        )
+        if fixed_brand.lower() not in {q.lower() for q in out}:
+            out.append(fixed_brand)
+
+    if "karotte" in lower_q:
+        moehren = re.sub(
+            r"karotten?", "Möhren", cleaned, flags=re.IGNORECASE
+        )
+        if moehren.lower() not in {q.lower() for q in out}:
+            out.append(moehren)
+
+    return out
+
+
+def _word_matches_haystack(
+    word: str, haystack: str, haystack_compact: str, haystack_phonetic: str
+) -> bool:
+    """Check if a query word (or any of its German grocery/beverage synonyms) matches."""
+    candidates = [word]
+    for group in _SYNONYM_GROUPS:
+        if word in group:
+            candidates.extend(g for g in group if g != word)
+
+    for cand in candidates:
+        if cand in haystack:
+            return True
+        cand_compact = cand.replace(" ", "")
+        if cand_compact in haystack_compact:
+            return True
+        cand_phonetic = _collapse_double_consonants(cand_compact)
+        if len(cand_phonetic) >= 4 and cand_phonetic in haystack_phonetic:
+            return True
+    return False
+
+
+def matches_query_qualifiers(item: dict[str, Any], query: str) -> bool:
+    """Verify explicit percentage/word tokens in `query` match candidate text."""
+    title_haystack = " ".join(
+        str(x or "") for x in (item.get("name"), item.get("description"))
+    ).lower()
+    full_haystack = " ".join(
+        str(x or "")
+        for x in (item.get("name"), item.get("description"), item.get("ingredients"))
+    ).lower()
+
+    full_norm = full_haystack.replace(",", ".")
+    full_compact = re.sub(r"\s+", "", full_norm)
+
+    for q_match in _QUALIFIER_TOKEN_REGEX.finditer(query):
+        qual_norm = re.sub(r"\s+", "", q_match.group(0)).replace(",", ".").lower()
+        if qual_norm not in full_compact:
+            return False
+
+    query_wo_quals = _QUALIFIER_TOKEN_REGEX.sub(" ", query)
+    words = [
+        w.lower()
+        for w in re.findall(r"[A-Za-zÄÖÜäöüß]{3,}", query_wo_quals)
+        if w.lower() not in _QUERY_FILLER_WORDS
+    ]
+    if not words:
+        return True
+
+    title_compact = re.sub(r"\s+", "", title_haystack)
+    title_phonetic = _collapse_double_consonants(title_compact)
+    return all(
+        _word_matches_haystack(w, title_haystack, title_compact, title_phonetic)
+        for w in words
+    )
+
+
+class FlaschenpostApiClient:
+    """Async client for communicating with the Flaschenpost backend."""
+
+    def __init__(
+        self,
+        email: str,
+        password: str,
+        session: aiohttp.ClientSession | None = None,
+        base_url: str = BASE_URL,
+    ) -> None:
+        """Initialize the client with credentials and dedicated cookie session."""
+        self._email = email
+        self._password = password
+        self._base_url = base_url.rstrip("/")
+        self._owns_session = session is None
+        self._session = session
+        self._bearer_token: str | None = None
+        self._web_user_guid: str | None = None
+        self._session_guid: str = str(uuid.uuid4())
+        self._cart_id: str | None = None
+        self._warehouse_id: int | None = None
+        self._customer_id: int | None = None
+        self._categories_cache: dict[int, list[dict[str, Any]]] = {}
+        self._auth_lock = asyncio.Lock()
+
+    @property
+    def web_user_guid(self) -> str | None:
+        """Return customer external GUID discovered at login."""
+        return self._web_user_guid
+
+    @property
+    def warehouse_id(self) -> int | None:
+        """Return customer's local warehouse ID discovered from cart/account."""
+        return self._warehouse_id
+
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            jar = aiohttp.CookieJar()
+            timeout = aiohttp.ClientTimeout(total=20)
+            self._session = aiohttp.ClientSession(cookie_jar=jar, timeout=timeout)
+            self._owns_session = True
+        return self._session
+
+    async def async_close(self) -> None:
+        """Close owned aiohttp session."""
+        if self._owns_session and self._session and not self._session.closed:
+            await self._session.close()
+
+    async def async_login(self) -> dict[str, Any]:
+        """Authenticate with email and password (`POST /api/v2/account/login`)."""
+        async with self._auth_lock:
+            session = await self._ensure_session()
+            url = f"{self._base_url}/api/v2/account/login"
+            headers = {
+                "User-Agent": APP_USER_AGENT,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "X-Correlation-Id": str(uuid.uuid4()),
+                "Idempotency-Key": str(uuid.uuid4()),
+            }
+            payload = {
+                "username": self._email,
+                "password": self._password,
+                "captcha": "",
+                "redirectUrl": "is-not-needed",
+            }
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status in (401, 403):
+                    text = await resp.text()
+                    raise FlaschenpostAuthError(
+                        f"Login rejected (HTTP {resp.status}): {text[:200]}"
+                    )
+                if resp.status >= 400:
+                    text = await resp.text()
+                    raise FlaschenpostError(
+                        f"Login failed (HTTP {resp.status}): {text[:200]}"
+                    )
+                data: dict[str, Any] = await resp.json()
+
+            token = data.get("bearerToken")
+            if not token:
+                raise FlaschenpostAuthError("Login response did not contain bearerToken")
+            if data.get("shopType", 0) != 0:
+                raise FlaschenpostAuthError(
+                    "Only B2C Flaschenpost accounts (shopType=0) are supported"
+                )
+
+            self._bearer_token = token
+            self._web_user_guid = data.get("webUserExternalGuid")
+            if data.get("userId"):
+                self._customer_id = int(data["userId"])
+            return data
+
+    async def async_refresh_token(self) -> str:
+        """Refresh JWT access token via cookies (`GET /api/v2/account/refresh`)."""
+        async with self._auth_lock:
+            session = await self._ensure_session()
+            url = f"{self._base_url}/api/v2/account/refresh"
+            headers = {
+                "User-Agent": APP_USER_AGENT,
+                "Accept": "application/json",
+                "X-instance": "axiosAuthClient",
+                "X-Correlation-Id": str(uuid.uuid4()),
+            }
+            async with session.get(url, headers=headers) as resp:
+                if resp.status >= 400:
+                    raise FlaschenpostAuthError(
+                        f"Token refresh failed (HTTP {resp.status})"
+                    )
+                data = await resp.json()
+
+            token = data.get("token")
+            if not token:
+                raise FlaschenpostAuthError("Refresh response missing token")
+            self._bearer_token = token
+            return token
+
+    async def _request(
+        self,
+        method: str,
+        path_or_url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+        extra_headers: dict[str, str] | None = None,
+        authenticated: bool = True,
+        retry_on_conflict: bool = False,
+    ) -> Any:
+        """Execute an HTTP request with automatic token refresh & 409 retry."""
+        if authenticated and not self._bearer_token:
+            await self.async_login()
+
+        session = await self._ensure_session()
+        url = (
+            path_or_url
+            if path_or_url.startswith("http")
+            else f"{self._base_url}{path_or_url}"
+        )
+
+        conflict_attempts = 3 if retry_on_conflict else 1
+        auth_retried = False
+
+        for attempt in range(conflict_attempts):
+            headers: dict[str, str] = {
+                "User-Agent": APP_USER_AGENT,
+                "Accept": "application/json",
+                "X-Correlation-Id": str(uuid.uuid4()),
+                "X-fp-frontend-version": FRONTEND_VERSION,
+            }
+            if self._cart_id:
+                headers["cart-id"] = self._cart_id
+            if authenticated and self._bearer_token:
+                headers["Authorization"] = f"Bearer {self._bearer_token}"
+            if json_body is not None:
+                headers["Content-Type"] = "application/json"
+                if method.upper() in ("POST", "PUT"):
+                    headers["Idempotency-Key"] = str(uuid.uuid4())
+            if extra_headers:
+                headers.update(extra_headers)
+
+            async with session.request(
+                method, url, params=params, json=json_body, headers=headers
+            ) as resp:
+                if authenticated and resp.status in (401, 403) and not auth_retried:
+                    auth_retried = True
+                    try:
+                        await self.async_refresh_token()
+                    except FlaschenpostError:
+                        await self.async_login()
+                    return await self._request(
+                        method,
+                        path_or_url,
+                        params=params,
+                        json_body=json_body,
+                        extra_headers=extra_headers,
+                        authenticated=authenticated,
+                        retry_on_conflict=retry_on_conflict,
+                    )
+
+                if resp.status == 409 and attempt + 1 < conflict_attempts:
+                    await asyncio.sleep(0.3 * (attempt + 1))
+                    continue
+
+                if resp.status == 204:
+                    return None
+
+                if resp.status >= 400:
+                    body_text = await resp.text()
+                    raise FlaschenpostError(
+                        f"{method} {path_or_url} failed (HTTP {resp.status}): "
+                        f"{body_text[:250]}"
+                    )
+
+                content_type = resp.headers.get("Content-Type", "")
+                if "json" in content_type:
+                    return await resp.json()
+                text = await resp.text()
+                return text
+
+        raise FlaschenpostError(f"Exceeded conflict retries for {method} {path_or_url}")
+
+    # -------------------------------------------------------------------------
+    # Account & Orders
+    # -------------------------------------------------------------------------
+
+    async def async_get_my_account(self) -> dict[str, Any]:
+        """Fetch customer profile and saved addresses (`GET /api/v2/myaccount`)."""
+        data: dict[str, Any] = await self._request("GET", "/api/v2/myaccount")
+        return data
+
+    async def async_get_active_orders(self, offset: int = 0) -> dict[str, Any]:
+        """Fetch active in-progress orders (`GET /api/v2/myaccount/order/active/{offset}`)."""
+        return await self._request("GET", f"/api/v2/myaccount/order/active/{offset}")
+
+    async def async_get_order_tracking(self, order_id: str) -> dict[str, Any]:
+        """Fetch live delivery tracking details for an order."""
+        return await self._request(
+            "GET", f"/api/v2/myaccount/order/tracking/{order_id}"
+        )
+
+    async def async_get_past_orders(
+        self, days: int = 180, offset: int = 0
+    ) -> dict[str, Any]:
+        """Fetch historical orders within the last `days` days."""
+        now = datetime.now(UTC)
+        start = now - timedelta(days=days)
+        frm = quote(start.strftime("%a, %d %b %Y %H:%M:%S GMT"))
+        unt = quote(now.strftime("%a, %d %b %Y %H:%M:%S GMT"))
+        return await self._request(
+            "GET", f"/api/v2/myaccount/order/history/{frm}/{unt}/{offset}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Cart & Delivery Slots
+    # -------------------------------------------------------------------------
+
+    async def async_get_cart(self) -> dict[str, Any]:
+        """Fetch active shopping cart (`GET /webshop-cart-api/api/v4/cart`)."""
+        cart: dict[str, Any] = await self._request("GET", "/webshop-cart-api/api/v4/cart")
+        self._update_cart_metadata(cart)
+        return cart
+
+    async def async_create_new_cart(self) -> dict[str, Any]:
+        """Reset/clear the customer's cart to a clean empty cart state."""
+        self._cart_id = None
+        cart = await self.async_get_cart()
+        actions: list[dict[str, Any]] = []
+
+        for li in cart.get("lineItems") or []:
+            if li.get("id"):
+                actions.append({"action": "removeLineItem", "lineItemId": li["id"]})
+
+        for dc in cart.get("discountCodes") or []:
+            dc_obj = dc.get("discountCode") or {}
+            if dc_obj.get("id"):
+                actions.append(
+                    {
+                        "action": "removeDiscountCode",
+                        "discountCode": {
+                            "id": dc_obj["id"],
+                            "typeId": "discount-code",
+                        },
+                    }
+                )
+
+        ship_fields = (cart.get("shippingCustomFields") or {}).get("fields") or {}
+        if any(
+            ship_fields.get(k) is not None
+            for k in (
+                "SelectedDeliveryType",
+                "SelectedDeliveryFrom",
+                "SelectedDeliveryUntil",
+                "SelectedDeliveryWindow",
+            )
+        ):
+            for field_name in (
+                "SelectedDeliveryFrom",
+                "SelectedDeliveryUntil",
+                "SelectedDeliveryWindow",
+                "SelectedDeliveryType",
+                "SelectedDeliveryValidation",
+                "SelectedDeliveryExpiry",
+                "SelectedDeliveryRegion",
+                "SelectedDeliveryDisplay",
+            ):
+                actions.append(
+                    {
+                        "action": "setShippingCustomField",
+                        "name": field_name,
+                        "value": None,
+                    }
+                )
+            actions.append(
+                {
+                    "action": "setCustomField",
+                    "name": "GreenDeliveryWindowRequestId",
+                    "value": None,
+                }
+            )
+
+        if actions:
+            cart = await self.async_apply_cart_actions(actions)
+        return cart
+
+    def _update_cart_metadata(self, cart: dict[str, Any]) -> None:
+        if isinstance(cart, dict):
+            if cart.get("id"):
+                self._cart_id = cart["id"]
+            fields = (cart.get("custom") or {}).get("fields") or {}
+            if fields.get("RecentlyUsedWarehouseId"):
+                self._warehouse_id = int(fields["RecentlyUsedWarehouseId"])
+            if fields.get("CustomerId"):
+                self._customer_id = int(fields["CustomerId"])
+
+    async def async_is_in_polygon_delivery_area(
+        self, latitude: float, longitude: float
+    ) -> bool:
+        """Check whether coordinates fall inside a Flaschenpost delivery area polygon."""
+        coords = f"{latitude}, {longitude}"
+        res = await self._request(
+            "GET",
+            f"/webshop-checkout-api/api/v2/address/isInPolygonDeliveryArea/{coords}",
+            authenticated=False,
+        )
+        return bool(res)
+
+    async def async_refresh_polygon_properties(self) -> dict[str, Any]:
+        """Trigger backend recalculation of cart polygon properties and update warehouse id."""
+        cart: dict[str, Any] = await self._request(
+            "PATCH",
+            "/webshop-cart-api/api/v4/refreshPolygonProperties",
+            json_body={},
+            retry_on_conflict=True,
+        )
+        self._update_cart_metadata(cart)
+        return cart
+
+    async def async_set_cart_positions(
+        self, positions: list[dict[str, int]]
+    ) -> dict[str, Any]:
+        """Add or update article quantities in cart (`POST /addCartPositions`)."""
+        normalized = [
+            {
+                "articleId": int(p["articleId"]),
+                "origin": int(p.get("origin", ORIGIN_UNKNOWN)),
+                "quantityTotal": int(p["quantityTotal"]),
+            }
+            for p in positions
+        ]
+        cart: dict[str, Any] = await self._request(
+            "POST",
+            "/webshop-cart-api/api/v4/addCartPositions",
+            json_body={"positions": normalized},
+            retry_on_conflict=True,
+        )
+        self._update_cart_metadata(cart)
+        return cart
+
+    async def async_apply_cart_actions(
+        self, actions: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Execute Commercetools update actions on cart (`POST /cart`)."""
+        cart: dict[str, Any] = await self._request(
+            "POST",
+            "/webshop-cart-api/api/v4/cart",
+            json_body={"actions": actions},
+            retry_on_conflict=True,
+        )
+        self._update_cart_metadata(cart)
+        return cart
+
+    async def async_remove_line_item(self, line_item_id: str) -> dict[str, Any]:
+        """Remove a line item from the cart."""
+        return await self.async_apply_cart_actions(
+            [{"action": "removeLineItem", "lineItemId": line_item_id}]
+        )
+
+    async def async_get_delivery_slots(
+        self,
+        cart: dict[str, Any] | None = None,
+        account: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Fetch available delivery slots (`GET /webshop-slots-api/api/v3/Slot/...`)."""
+        if cart is None:
+            cart = await self.async_get_cart()
+        cart_id = cart.get("id") or self._cart_id
+        if not cart_id:
+            return {"slots": [], "days": []}
+
+        fields = (cart.get("custom") or {}).get("fields") or {}
+        goods_cents = (fields.get("TotalGoods") or {}).get("centAmount", 0)
+        basket_class = compute_basket_class(int(goods_cents))
+        customer_id = fields.get("CustomerId") or self._customer_id or 0
+
+        geo = (
+            ((cart.get("shippingAddress") or {}).get("custom") or {})
+            .get("fields", {})
+            .get("GeoCoordinates")
+        )
+        if not geo and account:
+            addrs = account.get("addresses") or []
+            def_id = account.get("defaultShippingAddressId")
+            addr = next(
+                (a for a in addrs if a.get("id") == def_id),
+                addrs[0] if addrs else {},
+            )
+            geo = ((addr.get("custom") or {}).get("fields") or {}).get(
+                "GeoCoordinates"
+            )
+
+        if not geo:
+            return {"slots": [], "days": []}
+
+        return await self._request(
+            "GET",
+            f"/webshop-slots-api/api/v3/Slot/{cart_id}/{basket_class}",
+            params={"customerId": customer_id, "geocoords": geo},
+            extra_headers={"Ocp-Apim-Subscription-Key": SLOTS_APIM_KEY},
+            authenticated=False,
+        )
+
+    @staticmethod
+    def pick_available_slots(slots_response: dict[str, Any]) -> list[dict[str, Any]]:
+        """Filter enabled delivery slots using `Z1e`/`Q1e` webshop rules."""
+        days = slots_response.get("days") or []
+        disabled_dates = {
+            str(d.get("date"))[:10] for d in days if d.get("disabled") is True
+        }
+        today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+
+        valid: list[dict[str, Any]] = []
+        for slot in slots_response.get("slots") or []:
+            display = (slot.get("additionalData") or {}).get("display", "")
+            if str(display).lower() == "disable":
+                continue
+            stype = slot.get("type")
+            if stype == "DIRECT":
+                if today_str not in disabled_dates:
+                    valid.append(slot)
+            else:
+                sfrom = str(slot.get("from") or "")[:10]
+                if sfrom and slot.get("until") and sfrom not in disabled_dates:
+                    valid.append(slot)
+        return valid
+
+    async def async_select_delivery_slot(
+        self,
+        slot_type: str | None = None,
+        slot_from: str | None = None,
+    ) -> dict[str, Any]:
+        """Select a delivery slot on the cart via `setShippingCustomField` actions."""
+        cart = await self.async_get_cart()
+        slots_resp = await self.async_get_delivery_slots(cart=cart)
+        available = self.pick_available_slots(slots_resp)
+        if not available:
+            raise FlaschenpostOrderError("No enabled delivery slots currently available")
+
+        chosen: dict[str, Any] | None = None
+        if slot_from:
+            chosen = next(
+                (s for s in available if s.get("from") == slot_from), None
+            )
+        elif slot_type:
+            chosen = next(
+                (s for s in available if s.get("type") == slot_type), None
+            )
+        else:
+            chosen = next(
+                (s for s in available if s.get("type") == "DIRECT"), available[0]
+            )
+
+        if not chosen:
+            raise FlaschenpostOrderError(
+                f"Requested delivery slot (type={slot_type}, from={slot_from}) not found"
+            )
+
+        is_border = bool(slots_resp.get("isBorderRegion"))
+        display_raw = (chosen.get("additionalData") or {}).get("display", "")
+        display_mode = "GREEN" if str(display_raw).lower() == "green" else "NORMAL"
+
+        actions = [
+            {
+                "action": "setShippingCustomField",
+                "name": "SelectedDeliveryFrom",
+                "value": chosen.get("from"),
+            },
+            {
+                "action": "setShippingCustomField",
+                "name": "SelectedDeliveryUntil",
+                "value": chosen.get("until"),
+            },
+            {
+                "action": "setShippingCustomField",
+                "name": "SelectedDeliveryWindow",
+                "value": chosen.get("window"),
+            },
+            {
+                "action": "setShippingCustomField",
+                "name": "SelectedDeliveryType",
+                "value": chosen.get("type"),
+            },
+            {
+                "action": "setShippingCustomField",
+                "name": "SelectedDeliveryValidation",
+                "value": chosen.get("validation"),
+            },
+            {
+                "action": "setShippingCustomField",
+                "name": "SelectedDeliveryExpiry",
+                "value": slots_resp.get("expiry"),
+            },
+            {
+                "action": "setShippingCustomField",
+                "name": "SelectedDeliveryRegion",
+                "value": "BORDER" if is_border else "CORE",
+            },
+            {
+                "action": "setShippingCustomField",
+                "name": "SelectedDeliveryDisplay",
+                "value": display_mode,
+            },
+            {
+                "action": "setCustomField",
+                "name": "GreenDeliveryWindowRequestId",
+                "value": slots_resp.get("request_id"),
+            },
+        ]
+        return await self.async_apply_cart_actions(actions)
+
+    # -------------------------------------------------------------------------
+    # Categories, Product Search & Lazy Cart Resolution
+    # -------------------------------------------------------------------------
+
+    async def async_get_categories(
+        self, warehouse_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Fetch and cache the warehouse category & subcategory tree (`GET /php-product-api/v1/category/warehouse/{wh}`)."""
+        wh_id = warehouse_id or self._warehouse_id
+        if not wh_id:
+            await self.async_get_cart()
+            wh_id = self._warehouse_id or 1
+
+        if wh_id in self._categories_cache:
+            return self._categories_cache[wh_id]
+
+        raw = await self._request(
+            "GET",
+            f"/php-product-api/v1/category/warehouse/{wh_id}",
+            authenticated=False,
+        )
+        normalized: list[dict[str, Any]] = []
+        for top in raw if isinstance(raw, list) else []:
+            tname_map = top.get("name") or {}
+            tname = (
+                tname_map.get("de-DE") or next(iter(tname_map.values()), "")
+                if isinstance(tname_map, dict)
+                else str(tname_map)
+            ).strip()
+            tslug_map = top.get("slug") or {}
+            tslug = (
+                tslug_map.get("de-DE") or next(iter(tslug_map.values()), "")
+                if isinstance(tslug_map, dict)
+                else str(tslug_map)
+            ).strip()
+            subs: list[dict[str, Any]] = []
+            for child in top.get("children") or []:
+                cname_map = child.get("name") or {}
+                cname = (
+                    cname_map.get("de-DE") or next(iter(cname_map.values()), "")
+                    if isinstance(cname_map, dict)
+                    else str(cname_map)
+                ).strip()
+                cslug_map = child.get("slug") or {}
+                cslug = (
+                    cslug_map.get("de-DE") or next(iter(cslug_map.values()), "")
+                    if isinstance(cslug_map, dict)
+                    else str(cslug_map)
+                ).strip()
+                subs.append(
+                    {
+                        "id": child.get("id"),
+                        "external_id": child.get("externalId"),
+                        "name": cname,
+                        "slug": cslug,
+                    }
+                )
+            normalized.append(
+                {
+                    "id": top.get("id"),
+                    "external_id": top.get("externalId"),
+                    "name": tname,
+                    "slug": tslug,
+                    "subcategories": subs,
+                }
+            )
+
+        self._categories_cache[wh_id] = normalized
+        return normalized
+
+    async def _resolve_matching_subcategory_ids(
+        self, category_filter: str, warehouse_id: int
+    ) -> list[str]:
+        """Resolve `subcategory_id` (`externalId`) values matching `category_filter`."""
+        tree = await self.async_get_categories(warehouse_id=warehouse_id)
+        segments = [
+            _normalize_category_token(seg)
+            for seg in _CATEGORY_SPLIT_REGEX.split(category_filter)
+            if _normalize_category_token(seg)
+        ]
+        if not segments:
+            return []
+
+        matched_ids: list[str] = []
+        for top in tree:
+            top_tokens = [
+                _normalize_category_token(top.get("name") or ""),
+                _normalize_category_token(top.get("slug") or ""),
+            ]
+            for sub in top.get("subcategories") or []:
+                ext_id = sub.get("external_id")
+                if not ext_id:
+                    continue
+                sub_tokens = [
+                    _normalize_category_token(sub.get("name") or ""),
+                    _normalize_category_token(sub.get("slug") or ""),
+                ]
+                hierarchy_pool = [t for t in (*top_tokens, *sub_tokens) if t]
+                if all(
+                    any(_category_segment_matches(seg, cand) for cand in hierarchy_pool)
+                    for seg in segments
+                ):
+                    matched_ids.append(str(ext_id))
+        return matched_ids
+
+    async def async_search_products(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        warehouse_id: int | None = None,
+        category: str | None = None,
+        name_contains: str | None = None,
+        sort_by: str = SORT_RELEVANCE,
+        max_price_eur: float | None = None,
+        max_price_per_unit_eur: float | None = None,
+        max_price_per_kg_eur: float | None = None,
+        max_price_per_liter_eur: float | None = None,
+        only_available: bool = True,
+        only_crates: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Search products in customer's local warehouse with category, unit/kg/L, and crate filtering."""
+        wh_id = warehouse_id or self._warehouse_id
+        if not wh_id:
+            await self.async_get_cart()
+            wh_id = self._warehouse_id or 1
+
+        seen_ids: set[int] = set()
+        candidates: list[dict[str, Any]] = []
+
+        # When a category filter is specified and matches specific warehouse subcategories
+        # (e.g. "Reis & Getreide" -> subcategory_id=595), load that subcategory's catalog
+        # directly first so items are never drowned out by other categories in Elastic search
+        if category and category.strip():
+            sub_ids = await self._resolve_matching_subcategory_ids(category, wh_id)
+            if 1 <= len(sub_ids) <= 4:
+                for sub_id in sub_ids:
+                    sub_prods = await self._request(
+                        "GET",
+                        f"/php-product-api/v1/products/prv/warehouse/{wh_id}",
+                        params={"subcategory_id": sub_id},
+                        authenticated=False,
+                    )
+                    if isinstance(sub_prods, list):
+                        for prod in sub_prods:
+                            for summary in extract_all_product_variants(prod):
+                                aid = summary["article_id"]
+                                if aid not in seen_ids:
+                                    seen_ids.add(aid)
+                                    candidates.append(summary)
+
+        queries = normalize_search_queries(query)
+        fetch_size = (
+            50
+            if sort_by != SORT_RELEVANCE or name_contains or only_crates or category
+            else max(25, limit * 2)
+        )
+        for q_str in queries:
+            data = await self._request(
+                "GET",
+                f"/elastic-query-portal/{wh_id}/v2/search",
+                params={"q": q_str, "pageSize": min(100, fetch_size)},
+                authenticated=False,
+            )
+            for prod in data.get("results") or []:
+                for summary in extract_all_product_variants(prod):
+                    aid = summary["article_id"]
+                    if aid not in seen_ids:
+                        seen_ids.add(aid)
+                        candidates.append(summary)
+
+        # 1. Category filter (enforced strictly when specified)
+        if category and category.strip():
+            candidates = [
+                c for c in candidates if matches_category_filter(c, category)
+            ]
+
+        # 2. Availability filter
+        if only_available:
+            candidates = [c for c in candidates if c.get("is_available", True)]
+
+        # 3. Optional explicit substring filter
+        if name_contains:
+            needle = name_contains.strip().lower()
+            candidates = [
+                c
+                for c in candidates
+                if needle in str(c.get("name") or "").lower()
+                or needle in str(c.get("description") or "").lower()
+            ]
+
+        # 4. Strict token/qualifier/synonym match
+        if category and category.strip():
+            # When an explicit category was given, require query words to match
+            # instead of falling back to unrelated items in that category
+            candidates = [
+                c for c in candidates if matches_query_qualifiers(c, query)
+            ]
+        else:
+            strict = [c for c in candidates if matches_query_qualifiers(c, query)]
+            if strict:
+                candidates = strict
+
+        # 5. Crate filter (for "1 Kiste ...")
+        if only_crates:
+            crates = [c for c in candidates if c.get("is_crate")]
+            if crates:
+                candidates = crates
+            else:
+                multi = [c for c in candidates if (c.get("items_in_frame") or 1) >= 6]
+                if multi:
+                    candidates = multi
+
+        # 6. Price / unit-price / base-price ceiling filters
+        if max_price_eur is not None:
+            candidates = [
+                c for c in candidates if (c.get("price_eur") or 0) <= max_price_eur
+            ]
+        if max_price_per_unit_eur is not None:
+            candidates = [
+                c
+                for c in candidates
+                if c.get("price_per_unit_eur") is not None
+                and c["price_per_unit_eur"] <= max_price_per_unit_eur
+            ]
+        if max_price_per_kg_eur is not None:
+            candidates = [
+                c
+                for c in candidates
+                if c.get("price_per_kg_eur") is not None
+                and c["price_per_kg_eur"] <= max_price_per_kg_eur
+            ]
+        if max_price_per_liter_eur is not None:
+            candidates = [
+                c
+                for c in candidates
+                if c.get("price_per_liter_eur") is not None
+                and c["price_per_liter_eur"] <= max_price_per_liter_eur
+            ]
+
+        # 7. Sort
+        if sort_by == SORT_PRICE:
+            candidates.sort(
+                key=lambda c: (c.get("price_eur") is None, c.get("price_eur") or 1e9)
+            )
+        elif sort_by == SORT_PRICE_PER_UNIT:
+            candidates.sort(
+                key=lambda c: (
+                    c.get("price_per_unit_eur") is None,
+                    c.get("price_per_unit_eur") or 1e9,
+                    c.get("price_eur") or 1e9,
+                )
+            )
+        elif sort_by == SORT_PRICE_PER_KG:
+            candidates = [
+                c for c in candidates if c.get("price_per_kg_eur") is not None
+            ]
+            candidates.sort(
+                key=lambda c: (c["price_per_kg_eur"], c.get("price_eur") or 1e9)
+            )
+        elif sort_by == SORT_PRICE_PER_LITER:
+            candidates = [
+                c for c in candidates if c.get("price_per_liter_eur") is not None
+            ]
+            candidates.sort(
+                key=lambda c: (c["price_per_liter_eur"], c.get("price_eur") or 1e9)
+            )
+
+        return candidates[:limit]
+
+    async def async_resolve_item_for_cart(
+        self,
+        query: str,
+        *,
+        category: str | None = None,
+        unit_type: str = UNIT_TYPE_UNIT,
+        target_amount_base: float = 1.0,
+        article_id: int | None = None,
+        sort_by: str | None = None,
+        name_contains: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Lazily resolve a shopping list requirement against live warehouse stock, category, and prices."""
+        if article_id is not None:
+            cards = await self.async_get_products_by_article_ids([article_id])
+            chosen = cards[0] if cards else {"article_id": article_id, "name": query}
+            pkg_w = chosen.get("package_weight_g")
+            pkg_v = chosen.get("package_volume_ml")
+            if unit_type == UNIT_TYPE_WEIGHT_G and pkg_w and pkg_w > 0:
+                qty = max(1, math.ceil(target_amount_base / pkg_w - 1e-9))
+                delivered = round(qty * pkg_w, 1)
+            elif unit_type == UNIT_TYPE_VOLUME_ML and pkg_v and pkg_v > 0:
+                qty = max(1, math.ceil(target_amount_base / pkg_v - 1e-9))
+                delivered = round(qty * pkg_v, 1)
+            else:
+                qty = max(1, math.ceil(target_amount_base - 1e-9))
+                delivered = float(qty)
+            price_eur = float(chosen.get("price_eur") or 0.0)
+            return {
+                "article_id": int(article_id),
+                "quantity": qty,
+                "unit_type": unit_type,
+                "requested_amount_base": target_amount_base,
+                "delivered_amount_base": delivered,
+                "line_total_eur": round(qty * price_eur, 2),
+                "product": chosen,
+            }
+
+        if unit_type == UNIT_TYPE_WEIGHT_G:
+            effective_sort = sort_by or SORT_PRICE_PER_KG
+            pool = await self.async_search_products(
+                query,
+                limit=50,
+                category=category,
+                name_contains=name_contains,
+                sort_by=effective_sort,
+                only_available=True,
+            )
+            weighted = [
+                c
+                for c in pool
+                if c.get("package_weight_g") and float(c["package_weight_g"]) > 0
+            ]
+            if not weighted:
+                return None
+
+            def _packs_w(cand: dict[str, Any]) -> int:
+                return max(
+                    1,
+                    math.ceil(
+                        target_amount_base / float(cand["package_weight_g"]) - 1e-9
+                    ),
+                )
+
+            def _actual_w(cand: dict[str, Any]) -> float:
+                return _packs_w(cand) * float(cand["package_weight_g"])
+
+            max_reasonable_g = max(
+                target_amount_base * 2.0, target_amount_base + 500.0
+            )
+            reasonable = [c for c in weighted if _actual_w(c) <= max_reasonable_g]
+            if reasonable:
+                weighted = reasonable
+
+            if effective_sort == SORT_PRICE_PER_KG:
+                weighted.sort(
+                    key=lambda c: (
+                        c.get("price_per_kg_eur") is None,
+                        c.get("price_per_kg_eur") or 1e9,
+                        _packs_w(c) * float(c.get("price_eur") or 1e9),
+                        _actual_w(c) - target_amount_base,
+                    )
+                )
+            elif effective_sort == SORT_PRICE:
+                weighted.sort(
+                    key=lambda c: (
+                        _packs_w(c) * float(c.get("price_eur") or 1e9),
+                        c.get("price_per_kg_eur") or 1e9,
+                    )
+                )
+
+            winner = weighted[0]
+            qty = _packs_w(winner)
+            delivered = round(_actual_w(winner), 1)
+            return {
+                "article_id": int(winner["article_id"]),
+                "quantity": qty,
+                "unit_type": unit_type,
+                "requested_amount_base": target_amount_base,
+                "delivered_amount_base": delivered,
+                "line_total_eur": round(qty * float(winner.get("price_eur") or 0.0), 2),
+                "product": winner,
+            }
+
+        if unit_type == UNIT_TYPE_VOLUME_ML:
+            effective_sort = sort_by or SORT_PRICE_PER_LITER
+            pool = await self.async_search_products(
+                query,
+                limit=50,
+                category=category,
+                name_contains=name_contains,
+                sort_by=effective_sort,
+                only_available=True,
+            )
+            volumetric = [
+                c
+                for c in pool
+                if c.get("package_volume_ml") and float(c["package_volume_ml"]) > 0
+            ]
+            if not volumetric:
+                return None
+
+            def _packs_v(cand: dict[str, Any]) -> int:
+                return max(
+                    1,
+                    math.ceil(
+                        target_amount_base / float(cand["package_volume_ml"]) - 1e-9
+                    ),
+                )
+
+            def _actual_v(cand: dict[str, Any]) -> float:
+                return _packs_v(cand) * float(cand["package_volume_ml"])
+
+            max_reasonable_ml = max(
+                target_amount_base * 2.0, target_amount_base + 1500.0
+            )
+            reasonable_v = [
+                c for c in volumetric if _actual_v(c) <= max_reasonable_ml
+            ]
+            if reasonable_v:
+                volumetric = reasonable_v
+
+            if effective_sort == SORT_PRICE_PER_LITER:
+                volumetric.sort(
+                    key=lambda c: (
+                        c.get("price_per_liter_eur") is None,
+                        c.get("price_per_liter_eur") or 1e9,
+                        _packs_v(c) * float(c.get("price_eur") or 1e9),
+                    )
+                )
+            elif effective_sort == SORT_PRICE:
+                volumetric.sort(
+                    key=lambda c: (
+                        _packs_v(c) * float(c.get("price_eur") or 1e9),
+                        c.get("price_per_liter_eur") or 1e9,
+                    )
+                )
+
+            winner = volumetric[0]
+            qty = _packs_v(winner)
+            delivered = round(_actual_v(winner), 1)
+            return {
+                "article_id": int(winner["article_id"]),
+                "quantity": qty,
+                "unit_type": unit_type,
+                "requested_amount_base": target_amount_base,
+                "delivered_amount_base": delivered,
+                "line_total_eur": round(qty * float(winner.get("price_eur") or 0.0), 2),
+                "product": winner,
+            }
+
+        if unit_type == UNIT_TYPE_CRATE:
+            effective_sort = sort_by or SORT_PRICE_PER_LITER
+            pool = await self.async_search_products(
+                query,
+                limit=25,
+                category=category,
+                name_contains=name_contains,
+                sort_by=effective_sort,
+                only_available=True,
+                only_crates=True,
+            )
+            if not pool:
+                return None
+            winner = pool[0]
+            qty = max(1, math.ceil(target_amount_base - 1e-9))
+            return {
+                "article_id": int(winner["article_id"]),
+                "quantity": qty,
+                "unit_type": unit_type,
+                "requested_amount_base": target_amount_base,
+                "delivered_amount_base": float(qty),
+                "line_total_eur": round(qty * float(winner.get("price_eur") or 0.0), 2),
+                "product": winner,
+            }
+
+        effective_sort = sort_by or SORT_PRICE
+        pool = await self.async_search_products(
+            query,
+            limit=25,
+            category=category,
+            name_contains=name_contains,
+            sort_by=effective_sort,
+            only_available=True,
+        )
+        if not pool:
+            return None
+        winner = pool[0]
+        qty = max(1, math.ceil(target_amount_base - 1e-9))
+        return {
+            "article_id": int(winner["article_id"]),
+            "quantity": qty,
+            "unit_type": unit_type,
+            "requested_amount_base": target_amount_base,
+            "delivered_amount_base": float(qty),
+            "line_total_eur": round(qty * float(winner.get("price_eur") or 0.0), 2),
+            "product": winner,
+        }
+
+    async def async_get_products_by_article_ids(
+        self, article_ids: list[int], warehouse_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Hydrate product cards by numeric `articleId`s."""
+        if not article_ids:
+            return []
+        wh_id = warehouse_id or self._warehouse_id
+        if not wh_id:
+            await self.async_get_cart()
+            wh_id = self._warehouse_id or 1
+
+        joined = ",".join(str(int(a)) for a in article_ids[:50])
+        products = await self._request(
+            "GET",
+            f"/php-product-api/v1/products/prv/warehouse/{wh_id}",
+            params={"article_ids": joined},
+            authenticated=False,
+        )
+        if not isinstance(products, list):
+            return []
+        return [extract_product_summary(p) for p in products]
+
+    async def async_get_favorites(self, limit: int = 25) -> list[dict[str, Any]]:
+        """Fetch customer's personal favorite products ("Meine Getränke")."""
+        if not self._web_user_guid:
+            await self.async_login()
+        wh_id = self._warehouse_id
+        if not wh_id:
+            await self.async_get_cart()
+            wh_id = self._warehouse_id or 1
+
+        path = (
+            f"/ds-recommendation-api/api/v2/recommendations/my_products/"
+            f"{self._web_user_guid}/{self._session_guid}/{wh_id}"
+        )
+        data = await self._request(
+            "POST",
+            path,
+            params={"sp": "1"},
+            json_body={"basket": [], "cart": {}},
+            extra_headers={"Ocp-Apim-Subscription-Key": RECOMMENDATIONS_APIM_KEY},
+            authenticated=False,
+        )
+        recs = (data or {}).get("recommendations") or []
+        article_ids = [
+            int(r["articleId"])
+            for r in recs[:limit]
+            if r.get("articleId") is not None
+        ]
+        if not article_ids:
+            return []
+        return await self.async_get_products_by_article_ids(
+            article_ids, warehouse_id=wh_id
+        )
+
+    # -------------------------------------------------------------------------
+    # Saved Payment Instruments & Headless Ordering
+    # -------------------------------------------------------------------------
+
+    async def async_get_saved_payment_methods(self) -> list[dict[str, Any]]:
+        """Fetch all saved payment instruments on the customer profile (Credit Cards, PayPal, SEPA, Invoice)."""
+        cart = await self.async_get_cart()
+        cart_id = cart.get("id")
+        amount_cents = (cart.get("totalPrice") or {}).get("centAmount", 0)
+        account = await self.async_get_my_account()
+        custom = (account.get("custom") or {}).get("fields") or {}
+
+        # Resolve shopperReference & ltkaid (address key)
+        shopper_ref = ""
+        addr_key = ""
+        for a in account.get("addresses") or []:
+            ref = ((a.get("custom") or {}).get("fields") or {}).get("AddressReference")
+            if ref:
+                shopper_ref = ref
+                addr_key = a.get("key", "")
+                break
+
+        methods: list[dict[str, Any]] = []
+
+        # 1. Saved Credit Cards via Adyen
+        try:
+            cb = str(int(time.time() * 1000))
+            adyen_init = await self._request(
+                "GET",
+                f"/webshop-checkout-api/api/v1/payment/adyen/init?amount={amount_cents}&cart={cart_id}&allowedPaymentMethods=scheme&shopperReferenceAdd={shopper_ref}&cacheBuster={cb}",
+            )
+            session_resp = adyen_init.get("adyenSessionResponse") or {}
+            session_id = session_resp.get("id")
+            session_data = session_resp.get("sessionData")
+            if session_id and session_data:
+                setup_url = f"https://checkoutshopper-live.adyen.com/checkoutshopper/v1/sessions/{session_id}/setup?clientKey={ADYEN_CLIENT_KEY}"
+                async with self._session.post(setup_url, json={"sessionData": session_data}) as r:
+                    if r.status == 200:
+                        body = await r.json()
+                        for sp in body.get("storedPaymentMethods") or []:
+                            brand = str(sp.get("brand") or "Kreditkarte").upper()
+                            last4 = str(sp.get("lastFour") or "")
+                            exp = f"{sp.get('expiryMonth', '')}/{sp.get('expiryYear', '')}"
+                            methods.append({
+                                "id": f"credit_card:{sp['id']}",
+                                "payment_method": PAYMENT_CREDIT_CARD,
+                                "stored_payment_id": sp["id"],
+                                "brand": sp.get("brand"),
+                                "last4": last4,
+                                "label": f"Kreditkarte {brand} •••• {last4} (Exp: {exp})",
+                            })
+        except Exception as err:
+            _LOGGER.debug("Could not query Adyen stored cards: %s", err)
+
+        # Always include generic Credit Card option
+        if not any(m["payment_method"] == PAYMENT_CREDIT_CARD for m in methods):
+            methods.append({
+                "id": PAYMENT_CREDIT_CARD,
+                "payment_method": PAYMENT_CREDIT_CARD,
+                "label": "Kreditkarte (Credit Card via Adyen)",
+            })
+
+        # 2. Saved PayPal Accounts
+        paypal_entries = custom.get("PaypalCustomerIds") or []
+        for pe in paypal_entries:
+            try:
+                parsed = json.loads(pe) if isinstance(pe, str) else pe
+                email = parsed.get("customerEmailAddress") or self._email
+                cid = parsed.get("customerId") or email
+                methods.append({
+                    "id": f"paypal:{cid}",
+                    "payment_method": PAYMENT_PAYPAL,
+                    "stored_payment_id": cid,
+                    "label": f"PayPal ({email})",
+                    "email": email,
+                })
+            except Exception:
+                pass
+        if not paypal_entries:
+            methods.append({
+                "id": PAYMENT_PAYPAL,
+                "payment_method": PAYMENT_PAYPAL,
+                "label": "PayPal",
+            })
+
+        # 3. Saved SEPA Direct Debit Accounts
+        try:
+            direct_init = await self._request(
+                "GET",
+                "/webshop-checkout-api/api/v1/payment/direct/init",
+                params={
+                    "cart": cart_id,
+                    "amount": amount_cents,
+                    "shopperReferenceAdd": shopper_ref,
+                    "allowedPaymentMethods": "undefined",
+                    "ltkaid": addr_key,
+                    "cb": "0",
+                },
+            )
+            for d in direct_init.get("directDebitAccounts") or []:
+                if not d.get("isBlackListed") and d.get("ibanMasked"):
+                    iban = d["ibanMasked"]
+                    methods.append({
+                        "id": f"sepa:{iban[-4:]}",
+                        "payment_method": PAYMENT_SEPA,
+                        "iban_last4": iban[-4:],
+                        "label": f"SEPA Lastschrift ({iban})",
+                    })
+        except Exception as err:
+            _LOGGER.debug("Could not query direct debit accounts: %s", err)
+
+        if not any(m["payment_method"] == PAYMENT_SEPA for m in methods):
+            methods.append({
+                "id": PAYMENT_SEPA,
+                "payment_method": PAYMENT_SEPA,
+                "label": "SEPA Lastschrift (Direct Debit)",
+            })
+
+        # 4. Direct Invoice (if customer profile is eligible)
+        if custom.get("PaymentInvoiceAllowed"):
+            methods.append({
+                "id": PAYMENT_INVOICE,
+                "payment_method": PAYMENT_INVOICE,
+                "label": "Rechnung (Direct Invoice)",
+            })
+
+        return methods
+
+    async def async_place_order(
+        self,
+        *,
+        payment_method: str = PAYMENT_SEPA,
+        iban_last4: str | None = None,
+        stored_payment_id: str | None = None,
+        slot_type: str | None = None,
+        slot_from: str | None = None,
+    ) -> dict[str, Any]:
+        """Place the current cart order headlessly using saved Credit Card, PayPal, SEPA, or Invoice."""
+        if payment_method not in ALL_PAYMENT_METHODS:
+            raise FlaschenpostOrderError(
+                f"Unsupported payment_method '{payment_method}' (must be one of: {', '.join(ALL_PAYMENT_METHODS)})"
+            )
+
+        cart = await self.async_apply_cart_actions(
+            [{"action": "recalculate", "updateProductData": True}]
+        )
+        line_items = cart.get("lineItems") or []
+        if not line_items:
+            raise FlaschenpostOrderError("Cannot place order: cart is empty")
+
+        ship_fields = (cart.get("shippingCustomFields") or {}).get("fields") or {}
+        if slot_type or slot_from or not ship_fields.get("SelectedDeliveryType"):
+            cart = await self.async_select_delivery_slot(
+                slot_type=slot_type, slot_from=slot_from
+            )
+
+        cart_id = cart["id"]
+        amount_cents = (cart.get("totalPrice") or {}).get("centAmount", 0)
+        ship_addr = cart.get("shippingAddress") or {}
+        addr_ref = ((ship_addr.get("custom") or {}).get("fields") or {}).get(
+            "AddressReference", ""
+        )
+        addr_key = ship_addr.get("key", "")
+        if not addr_ref:
+            account = await self.async_get_my_account()
+            for a in account.get("addresses") or []:
+                ref = ((a.get("custom") or {}).get("fields") or {}).get(
+                    "AddressReference"
+                )
+                if ref:
+                    addr_ref = ref
+                    if not addr_key:
+                        addr_key = a.get("key", "")
+                    break
+        if not addr_ref:
+            raise FlaschenpostOrderError(
+                "Customer address is missing AddressReference for checkout initialization"
+            )
+
+        await self._request(
+            "POST",
+            "/webshop-checkout-api/api/v2/checkout/validatestock",
+            params={"cartId": cart_id},
+            json_body={},
+        )
+
+        if payment_method == PAYMENT_CREDIT_CARD:
+            cb = str(int(time.time() * 1000))
+            adyen_init = await self._request(
+                "GET",
+                f"/webshop-checkout-api/api/v1/payment/adyen/init?amount={amount_cents}&cart={cart_id}&allowedPaymentMethods=scheme&shopperReferenceAdd={addr_ref}&cacheBuster={cb}",
+            )
+            payment_id = adyen_init.get("paymentId")
+            session_resp = adyen_init.get("adyenSessionResponse") or {}
+            session_id = session_resp.get("id")
+            session_data = session_resp.get("sessionData")
+            if not payment_id or not session_id or not session_data:
+                raise FlaschenpostOrderError("Failed to initialize Adyen credit card session")
+
+            setup_url = f"https://checkoutshopper-live.adyen.com/checkoutshopper/v1/sessions/{session_id}/setup?clientKey={ADYEN_CLIENT_KEY}"
+            async with self._session.post(setup_url, json={"sessionData": session_data}) as setup_res:
+                setup_body = await setup_res.json()
+                stored_methods = setup_body.get("storedPaymentMethods") or []
+
+            if not stored_methods:
+                raise FlaschenpostOrderError(
+                    "No saved credit card found on your Flaschenpost account. "
+                    "Please save a credit card during checkout on flaschenpost.de first."
+                )
+
+            chosen_card = None
+            if stored_payment_id:
+                chosen_card = next(
+                    (c for c in stored_methods if c.get("id") == stored_payment_id),
+                    None,
+                )
+            if not chosen_card and iban_last4:
+                chosen_card = next(
+                    (c for c in stored_methods if str(c.get("lastFour")) == str(iban_last4)),
+                    None,
+                )
+            if not chosen_card:
+                chosen_card = stored_methods[0]
+
+            pay_url = f"https://checkoutshopper-live.adyen.com/checkoutshopper/v1/sessions/{session_id}/payments?clientKey={ADYEN_CLIENT_KEY}"
+            pay_payload = {
+                "sessionData": session_data,
+                "paymentMethod": {
+                    "type": "scheme",
+                    "storedPaymentMethodId": chosen_card["id"],
+                },
+            }
+            async with self._session.post(pay_url, json=pay_payload) as pay_res:
+                pay_data = await pay_res.json()
+
+            if pay_data.get("resultCode") != "Authorised":
+                raise FlaschenpostOrderError(
+                    f"Credit card authorization failed ({pay_data.get('resultCode', 'Unknown')})"
+                )
+
+            await self._request(
+                "POST",
+                "/webshop-checkout-api/api/v2/checkout/init",
+                json_body={"cartId": cart_id, "paymentId": payment_id},
+            )
+
+        elif payment_method == PAYMENT_PAYPAL:
+            pay_init = await self._request(
+                "GET",
+                f"/webshop-checkout-api/api/v1/payment/paypal/init?cart={cart_id}&shopperReferenceAdd={addr_ref}",
+                extra_headers={"PAYPAL-CLIENT-METADATA-ID": cart_id},
+            )
+            payment_id = pay_init.get("paymentId")
+            auth_url = pay_init.get("userAuthorizeUrl")
+            if not payment_id or not auth_url:
+                raise FlaschenpostOrderError("Failed to initialize PayPal payment session")
+            if not pay_init.get("baExists"):
+                raise FlaschenpostOrderError(
+                    "No active PayPal billing agreement found on Flaschenpost profile"
+                )
+
+            auth_res = await self._request(
+                "POST",
+                auth_url,
+                json_body={"dummy": "data"},
+                extra_headers={"PAYPAL-CLIENT-METADATA-ID": cart_id},
+            )
+            if isinstance(auth_res, dict) and auth_res.get("authorized") is False:
+                raise FlaschenpostOrderError("PayPal payment authorization was rejected")
+
+            await self._request(
+                "POST",
+                "/webshop-checkout-api/api/v2/checkout/init",
+                json_body={"cartId": cart_id, "paymentId": payment_id},
+            )
+
+        else:
+            allowed = "invoice" if payment_method == PAYMENT_INVOICE else "undefined"
+            pay_init = await self._request(
+                "GET",
+                "/webshop-checkout-api/api/v1/payment/direct/init",
+                params={
+                    "cart": cart_id,
+                    "amount": amount_cents,
+                    "shopperReferenceAdd": addr_ref,
+                    "allowedPaymentMethods": allowed,
+                    "ltkaid": addr_key,
+                    "cb": "0",
+                },
+            )
+            payment_id = pay_init.get("paymentId")
+            if not payment_id:
+                raise FlaschenpostOrderError(
+                    "Payment initialization did not return a paymentId"
+                )
+
+            await self._request(
+                "POST",
+                "/webshop-checkout-api/api/v2/checkout/init",
+                json_body={"cartId": cart_id, "paymentId": payment_id},
+            )
+
+            if payment_method == PAYMENT_SEPA:
+                accounts = [
+                    a
+                    for a in (pay_init.get("directDebitAccounts") or [])
+                    if not a.get("isBlackListed") and a.get("ibanMasked")
+                ]
+                if not accounts:
+                    raise FlaschenpostOrderError(
+                        "No active saved SEPA Direct Debit account found on Flaschenpost profile"
+                    )
+                chosen_acc = accounts[0]
+                if iban_last4:
+                    matched = next(
+                        (
+                            a
+                            for a in accounts
+                            if str(a.get("ibanMasked", "")).endswith(str(iban_last4))
+                        ),
+                        None,
+                    )
+                    if not matched:
+                        raise FlaschenpostOrderError(
+                            f"No saved SEPA IBAN ending in '{iban_last4}' found"
+                        )
+                    chosen_acc = matched
+
+                auth_url = pay_init.get("userAuthorizeUrl")
+                session_id = pay_init.get("sessionId")
+                if not auth_url or not session_id:
+                    raise FlaschenpostOrderError(
+                        "SEPA payment init missing userAuthorizeUrl or sessionId"
+                    )
+                auth_res = await self._request(
+                    "POST",
+                    auth_url,
+                    json_body={
+                        "debitAccount": chosen_acc["ibanMasked"],
+                        "sessionId": session_id,
+                    },
+                )
+                if not isinstance(auth_res, dict) or not auth_res.get("authorized"):
+                    raise FlaschenpostOrderError(
+                        f"SEPA Direct Debit authorization rejected: {auth_res}"
+                    )
+
+        result: dict[str, Any] = await self._request(
+            "POST",
+            "/webshop-checkout-api/api/v2/checkout/complete",
+            json_body={"cartId": cart_id},
+        )
+        return result.get("order") or result

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":semanticCommitTypeAll(chore)"
+  ],
+  "assignees": [
+    "geNAZt"
+  ],
+  "packageRules": [
+    {
+      "description": "Automerge minor and patch updates for all dependencies",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest"
+      ],
+      "automerge": true,
+      "automergeType": "branch"
+    },
+    {
+      "description": "Group GitHub Actions updates",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions",
+      "automerge": true,
+      "automergeType": "branch"
+    },
+    {
+      "description": "Automerge GitHub Action pin digests and minor updates",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pinDigest"
+      ],
+      "automerge": true
+    }
+  ]
+}

@@ -1,0 +1,1238 @@
+openapi: 3.1.0
+info:
+  title: Flaschenpost B2C Webshop & App API (Live-Verified Contract)
+  version: 4.2.4-verified
+  description: |
+    Complete, live-verified OpenAPI 3.1 specification extracted from:
+    1. `de.flaschenpost.app.apk` + `config.arm64_v8a.apk` (`libapp.so`):
+       - Native Dart AOT (`FpApiClient` / `FpApiManager`) handles only push token registration (`/v1/accounts/...`) and app version check (`/v1/...`).
+       - All customer authentication, shopping, favorites, cart, slots, ordering, and order tracking run through `https://www.flaschenpost.de` inside the hybrid WebView (`User-Agent: ... flaschenpost App Android 4.2.4`).
+    2. Production `https://www.flaschenpost.de` SPA bundle (`v-2026-10-29t08:40:30.097z`) & live read-only backend verification (`HTTP 200` across login, refresh, myaccount, cart, active orders, order history, favorites, delivery slots, product lookup, and warehouse search).
+
+servers:
+  - url: https://www.flaschenpost.de
+    description: Production B2C Webshop & Reverse-Proxied Microservices (verified live)
+  - url: https://api.flaschen.io/account-api/api
+    description: Production Mobile Push Registration BFF (`FpApiClient.registerPushToken`)
+  - url: https://api.flaschen.io/webshop-appi-api/api
+    description: Production Mobile App Version BFF (`FpApiManager.checkAppVersion`)
+
+tags:
+  - name: Auth
+    description: Headless email/password login, cookie token refresh, and logout
+  - name: MyAccount
+    description: Customer profile, addresses, active orders, live delivery tracking, and order history
+  - name: FavoritesAndCatalog
+    description: Personal favorites ("Meine Getränke"), warehouse-scoped search, and product details
+  - name: Cart
+    description: Commercetools cart retrieval, article quantity updates, and slot/voucher actions
+  - name: DeliverySlots
+    description: Available delivery windows (`DIRECT` & scheduled) and shop status
+  - name: CheckoutAndOrdering
+    description: Headless SEPA Direct Debit / Invoice payment authorization, stock validation, and order placement
+  - name: OrderAndDeposit
+    description: Active order check and Pfand/bottle deposit announcement
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT `bearerToken` from `POST /api/v2/account/login` or `token` from `GET /api/v2/account/refresh`.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: refreshToken
+      description: Cookies set on login (`.AspNetCore.Cookies`, `.Fp.Session`, `fp-account-fid`, `refreshToken`) used by `GET /api/v2/account/refresh`.
+    apimKey:
+      type: apiKey
+      in: header
+      name: Ocp-Apim-Subscription-Key
+      description: |
+        Public client APIM subscription keys:
+        - `DeliverySlotsService`: `1a3c9dbd77134dc3ae9eebc67ad939d2`
+        - `Recommendations / Favorites`: `a0c649b18a0642ad96216e0888727e81;product=webshop-b2c-clientside`
+
+  parameters:
+    CorrelationIdHeader:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+    FrontendVersionHeader:
+      name: X-fp-frontend-version
+      in: header
+      required: false
+      schema:
+        type: string
+        example: v-2026-10-29t08:40:30.097z
+    CartIdHeader:
+      name: cart-id
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    LoginRequest:
+      type: object
+      required:
+        - username
+        - password
+        - redirectUrl
+      properties:
+        username:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+        captcha:
+          type: string
+          default: ""
+          description: Verified working headlessly with empty string `""`.
+        redirectUrl:
+          type: string
+          default: is-not-needed
+
+    LoginResponse:
+      type: object
+      required:
+        - bearerToken
+        - refreshToken
+        - userId
+        - webUserExternalGuid
+        - shopType
+      properties:
+        bearerToken:
+          type: string
+        refreshToken:
+          type: string
+        userId:
+          type: integer
+        firstname:
+          type: string
+        lastname:
+          type: string
+        email:
+          type: string
+          format: email
+        webUserExternalGuid:
+          type: string
+          format: uuid
+          description: Customer external GUID used in favorites/recommendation endpoints.
+        shopType:
+          type: integer
+          description: "`0` for B2C."
+
+    TokenResponse:
+      type: object
+      required:
+        - token
+      properties:
+        token:
+          type: string
+        refreshToken:
+          type: string
+
+    CentPrecisionMoney:
+      type: object
+      required:
+        - centAmount
+        - currencyCode
+        - type
+        - fractionDigits
+      properties:
+        type:
+          type: string
+          example: centPrecision
+        currencyCode:
+          type: string
+          example: EUR
+        centAmount:
+          type: integer
+          example: 2499
+        fractionDigits:
+          type: integer
+          example: 2
+
+    Address:
+      type: object
+      properties:
+        id:
+          type: string
+        key:
+          type: string
+        country:
+          type: string
+          default: DE
+        firstName:
+          type: string
+        lastName:
+          type: string
+        streetName:
+          type: string
+        streetNumber:
+          type: string
+        additionalStreetInfo:
+          type: string
+        postalCode:
+          type: string
+        city:
+          type: string
+        company:
+          type: string
+        phone:
+          type: string
+        additionalAddressInfo:
+          type: string
+        custom:
+          type: object
+          properties:
+            fields:
+              type: object
+              properties:
+                AddressReference:
+                  type: string
+                  description: Passed as `shopperReferenceAdd` to `/webshop-checkout-api/api/v1/payment/direct/init`.
+                Caption:
+                  type: string
+                Validation:
+                  type: string
+                Floor:
+                  type: string
+                HasElevator:
+                  type: boolean
+                GeoCoordinates:
+                  type: string
+                  example: "51.9607, 7.6261"
+                IsDeliveryArea:
+                  type: boolean
+
+    CustomerAccount:
+      type: object
+      properties:
+        version:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        lastModifiedAt:
+          type: string
+          format: date-time
+        key:
+          type: string
+        externalId:
+          type: string
+        email:
+          type: string
+          format: email
+        defaultShippingAddressId:
+          type: string
+        defaultBillingAddressId:
+          type: string
+        isEmailVerified:
+          type: boolean
+        addresses:
+          type: array
+          items:
+            $ref: "#/components/schemas/Address"
+        custom:
+          type: object
+          properties:
+            fields:
+              type: object
+              properties:
+                BillingType:
+                  type: string
+                WebUserId:
+                  type: string
+                DeliveredOrders:
+                  type: integer
+                ShopType:
+                  type: string
+                PaymentInvoiceAllowed:
+                  type: boolean
+                CustomerType:
+                  type: string
+                PaymentDebitLimit:
+                  $ref: "#/components/schemas/CentPrecisionMoney"
+
+    OrderStatusIconState:
+      type: string
+      enum:
+        - OrderPlaced
+        - PickingStarted
+        - OrderLeftWarehouse
+        - SuccessfullyDelivered
+        - Cancelled
+
+    DeliveryCustomFields:
+      type: object
+      properties:
+        CurrentStopsBeforeArrival:
+          type: integer
+          description: Stops remaining before driver arrives (`0` = driver is heading directly to customer).
+        ActualTimeOfDelivery:
+          type: string
+          format: date-time
+
+    LineItem:
+      type: object
+      properties:
+        id:
+          type: string
+        productId:
+          type: string
+        productKey:
+          type: string
+        name:
+          type: object
+          additionalProperties:
+            type: string
+          example:
+            de-DE: Gerolsteiner Medium
+        variant:
+          type: object
+          properties:
+            id:
+              type: integer
+            sku:
+              type: string
+              description: Numeric Flaschenpost `articleId` as string.
+            key:
+              type: string
+            images:
+              type: array
+              items:
+                type: object
+                properties:
+                  url:
+                    type: string
+        quantity:
+          type: integer
+        price:
+          type: object
+          properties:
+            value:
+              $ref: "#/components/schemas/CentPrecisionMoney"
+            custom:
+              type: object
+              properties:
+                fields:
+                  type: object
+                  properties:
+                    PricePerUnitText:
+                      type: string
+                    ArticleStatus:
+                      type: string
+        totalPrice:
+          $ref: "#/components/schemas/CentPrecisionMoney"
+
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        lastModifiedAt:
+          type: string
+          format: date-time
+        orderNumber:
+          type: string
+        totalPrice:
+          $ref: "#/components/schemas/CentPrecisionMoney"
+        shippingAddress:
+          $ref: "#/components/schemas/Address"
+        billingAddress:
+          $ref: "#/components/schemas/Address"
+        lineItems:
+          type: array
+          items:
+            $ref: "#/components/schemas/LineItem"
+        customLineItems:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        custom:
+          type: object
+          properties:
+            fields:
+              type: object
+              properties:
+                OfficialStatusETAFrom:
+                  type: string
+                  format: date-time
+                OfficialStatusETAUntil:
+                  type: string
+                  format: date-time
+                OfficialStatusMessage:
+                  type: string
+                OfficialStatusIconState:
+                  $ref: "#/components/schemas/OrderStatusIconState"
+                RecentlyUsedWarehouseId:
+                  type: integer
+                TotalGoods:
+                  $ref: "#/components/schemas/CentPrecisionMoney"
+                TotalDeposit:
+                  $ref: "#/components/schemas/CentPrecisionMoney"
+                TotalDelivery:
+                  $ref: "#/components/schemas/CentPrecisionMoney"
+                TotalSavings:
+                  $ref: "#/components/schemas/CentPrecisionMoney"
+                PaymentType:
+                  type: string
+        shippingCustomFields:
+          type: object
+          properties:
+            fields:
+              type: object
+              properties:
+                SelectedDeliveryFrom:
+                  type: string
+                  format: date-time
+                SelectedDeliveryUntil:
+                  type: string
+                  format: date-time
+                SelectedDeliveryType:
+                  type: string
+                  example: DIRECT
+                SelectedDeliveryWindow:
+                  type: integer
+                SelectedDeliveryRegion:
+                  type: string
+                SelectedDeliveryDisplay:
+                  type: string
+        shippingInfo:
+          type: object
+          properties:
+            deliveries:
+              type: array
+              items:
+                type: object
+                properties:
+                  custom:
+                    type: object
+                    properties:
+                      fields:
+                        $ref: "#/components/schemas/DeliveryCustomFields"
+
+    PaginatedOrdersResponse:
+      type: object
+      properties:
+        limit:
+          type: integer
+        offset:
+          type: integer
+        count:
+          type: integer
+        total:
+          type: integer
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Order"
+
+    ArticleOrigin:
+      type: integer
+      description: |
+        Integer origin enum (`_b`):
+        `0` = Unknown, `1` = ProductRangeView, `2` = ProductDetailPage, `3` = ArticleSearch,
+        `5` = MyDrinks, `12` = LastOrder, `14` = InstantSearchResults, `15` = Favorites,
+        `16` = Cart, `20` = Reorder.
+      default: 0
+
+    CartPositionInput:
+      type: object
+      required:
+        - articleId
+        - origin
+        - quantityTotal
+      properties:
+        articleId:
+          type: integer
+        origin:
+          $ref: "#/components/schemas/ArticleOrigin"
+        quantityTotal:
+          type: integer
+          minimum: 0
+          description: Desired total quantity in cart (`0` removes the article).
+
+    CartAction:
+      type: object
+      required:
+        - action
+      properties:
+        action:
+          type: string
+      additionalProperties: true
+
+    Cart:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+        cartState:
+          type: string
+          example: Active
+        totalLineItemQuantity:
+          type: integer
+        totalPrice:
+          $ref: "#/components/schemas/CentPrecisionMoney"
+        shippingAddress:
+          $ref: "#/components/schemas/Address"
+        billingAddress:
+          $ref: "#/components/schemas/Address"
+        lineItems:
+          type: array
+          items:
+            $ref: "#/components/schemas/LineItem"
+        customLineItems:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        custom:
+          type: object
+          properties:
+            fields:
+              type: object
+              properties:
+                CustomerId:
+                  type: integer
+                RecentlyUsedWarehouseId:
+                  type: integer
+                WarehouseZipcode:
+                  type: string
+                DeliveryCondition:
+                  type: string
+                TotalGoods:
+                  $ref: "#/components/schemas/CentPrecisionMoney"
+                TotalDeposit:
+                  $ref: "#/components/schemas/CentPrecisionMoney"
+                TotalDelivery:
+                  $ref: "#/components/schemas/CentPrecisionMoney"
+                TotalSavings:
+                  $ref: "#/components/schemas/CentPrecisionMoney"
+                OrderToExtend:
+                  type: string
+
+    DeliverySlot:
+      type: object
+      properties:
+        from:
+          type: string
+          format: date-time
+        until:
+          type: string
+          format: date-time
+        isPreOrder:
+          type: boolean
+        type:
+          type: string
+          example: DIRECT
+        window:
+          type: integer
+        validation:
+          type: string
+        userPreviouslySelected:
+          type: boolean
+        additionalData:
+          type: object
+          properties:
+            displayType:
+              type: integer
+            display:
+              type: string
+              example: enable
+            recommend:
+              type: boolean
+
+    DeliverySlotsResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+        expiry:
+          type: string
+          format: date-time
+        shopState:
+          type: string
+        isBorderRegion:
+          type: boolean
+        days:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+                format: date
+              disabled:
+                type: boolean
+        slots:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeliverySlot"
+        shopCommunication:
+          type: object
+          nullable: true
+          properties:
+            title:
+              type: string
+            message:
+              type: string
+            communicatedDeliveryTime:
+              type: integer
+
+    DirectPaymentInitResponse:
+      type: object
+      properties:
+        paymentId:
+          type: string
+          format: uuid
+        sessionId:
+          type: string
+        userAuthorizeUrl:
+          type: string
+          format: uri
+        directDebitAccounts:
+          type: array
+          items:
+            type: object
+            properties:
+              ibanMasked:
+                type: string
+                example: XXXXXXXXXXXXXXXXXX1234
+              isBlackListed:
+                type: boolean
+
+    RecommendationsResponse:
+      type: object
+      properties:
+        metadata:
+          type: object
+          properties:
+            title:
+              type: string
+            link:
+              type: string
+              nullable: true
+        recommendations:
+          type: array
+          items:
+            type: object
+            properties:
+              articleId:
+                type: integer
+              origin:
+                type: integer
+              isSponsored:
+                type: boolean
+
+paths:
+  /api/v2/account/login:
+    post:
+      tags: [Auth]
+      summary: Authenticate with email and password (verified headless HTTP 200)
+      operationId: login
+      parameters:
+        - $ref: "#/components/parameters/CorrelationIdHeader"
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Authenticated successfully (`bearerToken`, `refreshToken`, `webUserExternalGuid`, and auth cookies)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+
+  /api/v2/account/refresh:
+    get:
+      tags: [Auth]
+      summary: Refresh JWT access token using session/refresh cookies (verified HTTP 200)
+      operationId: refreshToken
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Refreshed bearer token and refresh token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+
+  /api/v2/account/logout:
+    get:
+      tags: [Auth]
+      summary: Invalidate current session
+      operationId: logout
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Logged out
+
+  /api/v2/myaccount:
+    get:
+      tags: [MyAccount]
+      summary: Get customer profile, addresses, and payment eligibility (verified HTTP 200)
+      operationId: getMyAccount
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/FrontendVersionHeader"
+        - $ref: "#/components/parameters/CartIdHeader"
+      responses:
+        "200":
+          description: Customer account details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CustomerAccount"
+
+  /api/v2/myaccount/order/active/{offset}:
+    get:
+      tags: [MyAccount]
+      summary: List currently active (in-progress) orders (verified HTTP 200)
+      operationId: getActiveOrders
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: offset
+          in: path
+          required: true
+          schema:
+            type: integer
+            default: 0
+        - $ref: "#/components/parameters/FrontendVersionHeader"
+        - $ref: "#/components/parameters/CartIdHeader"
+      responses:
+        "200":
+          description: Paginated active orders
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedOrdersResponse"
+
+  /api/v2/myaccount/order/tracking/{orderId}:
+    get:
+      tags: [MyAccount]
+      summary: Get live delivery tracking state, ETA window, and stops remaining
+      operationId: getOrderTracking
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/FrontendVersionHeader"
+      responses:
+        "200":
+          description: Order enriched with live tracking fields
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+
+  /api/v2/myaccount/order/googleMapsTrackingId/{orderId}:
+    get:
+      tags: [MyAccount]
+      summary: Get live driver map tracking ID for an active delivery
+      operationId: getGoogleMapsTrackingId
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Tracking identifier
+          content:
+            application/json:
+              schema:
+                type: string
+
+  /api/v2/myaccount/order/history/{timespanFrom}/{timespanUntil}/{offset}:
+    get:
+      tags: [MyAccount]
+      summary: Get past order history within an RFC 2822 / ISO timespan (verified HTTP 200)
+      operationId: getPastOrders
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: timespanFrom
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "Thu, 07 May 2026 11:22:00 GMT"
+        - name: timespanUntil
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "Wed, 03 Nov 2026 11:22:00 GMT"
+        - name: offset
+          in: path
+          required: true
+          schema:
+            type: integer
+            default: 0
+        - $ref: "#/components/parameters/FrontendVersionHeader"
+      responses:
+        "200":
+          description: Paginated past orders
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedOrdersResponse"
+
+  /ds-recommendation-api/api/v2/recommendations/my_products/{userGuid}/{sessionGuid}/{warehouseId}:
+    post:
+      tags: [FavoritesAndCatalog]
+      summary: Get customer's personal favorite / frequently bought articles (verified HTTP 200)
+      operationId: getMyFavoriteProducts
+      security:
+        - apimKey: []
+      parameters:
+        - name: userGuid
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: "`webUserExternalGuid` from login response / `fp-account-fid` cookie."
+        - name: sessionGuid
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: warehouseId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: sp
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "1"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                basket:
+                  type: array
+                  items: {}
+                cart:
+                  type: object
+      responses:
+        "200":
+          description: Ordered list of personal favorite `articleId`s
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecommendationsResponse"
+
+  /elastic-query-portal/{warehouseId}/v2/search:
+    get:
+      tags: [FavoritesAndCatalog]
+      summary: Search products available in a specific Flaschenpost warehouse (verified HTTP 200)
+      operationId: searchWarehouseProducts
+      parameters:
+        - name: warehouseId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: Warehouse-scoped Commercetools product search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+
+  /php-product-api/v1/products/prv/warehouse/{warehouseId}:
+    get:
+      tags: [FavoritesAndCatalog]
+      summary: Hydrate product names, prices, bottle deposit, and images by article IDs (verified HTTP 200)
+      operationId: getWarehouseProductsByArticleIds
+      parameters:
+        - name: warehouseId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: article_ids
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Comma-separated `articleId`s (e.g. `410,4723`).
+      responses:
+        "200":
+          description: List of Commercetools product cards for the warehouse
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+
+  /webshop-cart-api/api/v4/cart:
+    get:
+      tags: [Cart]
+      summary: Get current shopping cart (verified HTTP 200)
+      operationId: getCart
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CartIdHeader"
+        - $ref: "#/components/parameters/FrontendVersionHeader"
+      responses:
+        "200":
+          description: Current Commercetools cart
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+    post:
+      tags: [Cart]
+      summary: Execute Commercetools update actions on cart (select slot, remove line item, voucher, recalculate)
+      operationId: updateCartActions
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CartIdHeader"
+        - $ref: "#/components/parameters/FrontendVersionHeader"
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - actions
+              properties:
+                actions:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/CartAction"
+      responses:
+        "200":
+          description: Updated cart
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+        "409":
+          description: Concurrent cart version modification (retry)
+
+  /webshop-cart-api/api/v4/addCartPositions:
+    post:
+      tags: [Cart]
+      summary: Add or set article quantities in cart
+      operationId: addCartPositions
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CartIdHeader"
+        - $ref: "#/components/parameters/FrontendVersionHeader"
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - positions
+              properties:
+                positions:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/CartPositionInput"
+      responses:
+        "200":
+          description: Updated cart
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+        "409":
+          description: Concurrent cart modification (retry)
+
+  /webshop-slots-api/api/v3/Slot/{cartId}/{orderClass}:
+    get:
+      tags: [DeliverySlots]
+      summary: Get available delivery slots for cart and coordinates (verified HTTP 200)
+      operationId: getDeliverySlotsV3
+      security:
+        - apimKey: []
+      parameters:
+        - name: cartId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: orderClass
+          in: path
+          required: true
+          schema:
+            type: integer
+            default: 1
+        - name: customerId
+          in: query
+          required: true
+          schema:
+            type: integer
+        - name: geocoords
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Delivery slots, shop state, and `request_id` / `expiry` for slot selection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeliverySlotsResponse"
+
+  /webshop-checkout-api/api/v1/payment/direct/init:
+    get:
+      tags: [CheckoutAndOrdering]
+      summary: Initialize saved SEPA Direct Debit (`undefined`) or Direct Invoice (`invoice`) payment
+      operationId: initDirectPayment
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: cart
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: amount
+          in: query
+          required: true
+          schema:
+            type: integer
+          description: Cart `totalPrice.centAmount`.
+        - name: shopperReferenceAdd
+          in: query
+          required: true
+          schema:
+            type: string
+          description: "`cart.shippingAddress.custom.fields.AddressReference`."
+        - name: allowedPaymentMethods
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: ["undefined", "invoice"]
+        - name: ltkaid
+          in: query
+          required: false
+          schema:
+            type: string
+          description: "`cart.shippingAddress.key`."
+        - name: cb
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "0"
+      responses:
+        "200":
+          description: Payment ID, session ID, authorize URL, and saved masked IBANs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DirectPaymentInitResponse"
+
+  /webshop-checkout-api/api/v2/checkout/init:
+    post:
+      tags: [CheckoutAndOrdering]
+      summary: Bind selected payment ID to cart and prepare checkout
+      operationId: initCheckout
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - cartId
+                - paymentId
+              properties:
+                cartId:
+                  type: string
+                  format: uuid
+                paymentId:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: Checkout initialized
+
+  /webshop-checkout-api/api/v2/checkout/validatestock:
+    post:
+      tags: [CheckoutAndOrdering]
+      summary: Validate warehouse stock for all cart items prior to completing order
+      operationId: validateStock
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: cartId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Stock validation result
+
+  /webshop-checkout-api/api/v2/checkout/complete:
+    post:
+      tags: [CheckoutAndOrdering]
+      summary: Finalize checkout and place the order
+      operationId: completeCheckout
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - cartId
+              properties:
+                cartId:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: Placed order
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  order:
+                    $ref: "#/components/schemas/Order"
+
+  /webshop-checkout-api/api/v2/checkout/completeOrderToExtend:
+    post:
+      tags: [CheckoutAndOrdering]
+      summary: Extend an already-placed active order with current cart items
+      operationId: completeOrderToExtend
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - cartId
+              properties:
+                cartId:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: Extended order result
+
+  /webshop-coto-api/api/v1/Order/{orderId}:
+    get:
+      tags: [OrderAndDeposit]
+      summary: Get order details including Pfand/deposit custom line items
+      operationId: getCotoOrder
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Order details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
