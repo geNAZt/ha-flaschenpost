@@ -70,7 +70,9 @@ from custom_components.flaschenpost.api import (
     FlaschenpostApiClient,
     cents_to_eur,
     compute_basket_class,
+    compute_optimal_pack_plan,
     extract_negative_keywords,
+    extract_price_tiers,
     extract_product_categories,
     extract_product_summary,
     matches_category_filter,
@@ -1668,6 +1670,114 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             self.assertIn("flaschenpost-panel", js_content)
             self.assertIn("flaschenpost-card", js_content)
             self.assertIn("flaschenpost-view", js_content)
+
+        asyncio.run(_run())
+
+    def test_mengenrabatte_and_optimal_pack_plan(self) -> None:
+        """Verify Mengenrabatte (volume discounts): Item B (119€, 60€ off at 3) beats Item A (99€) when needing 2 items."""
+        # 1. Test tier extraction from Commercetools price.tiers
+        ct_variant = {
+            "sku": "1002",
+            "price": {
+                "value": {"centAmount": 11900},
+                "tiers": [
+                    {
+                        "minimumQuantity": 3,
+                        "value": {"centAmount": 5900},
+                    }
+                ],
+            },
+        }
+        tiers_ct = extract_price_tiers(ct_variant, 119.0, {}, ct_variant["price"])
+        self.assertEqual(len(tiers_ct), 1)
+        self.assertEqual(tiers_ct[0]["min_quantity"], 3)
+        self.assertEqual(tiers_ct[0]["unit_price_eur"], 59.0)
+        self.assertEqual(tiers_ct[0]["discount_eur"], 60.0)
+
+        # 2. Test tier extraction from attributes (e.g. Mengenrabatt / Staffelpreise with discount off)
+        attr_variant = {
+            "sku": "1003",
+            "price": {"value": {"centAmount": 11900}},
+            "attributes": [
+                {
+                    "name": "Mengenrabatt",
+                    "value": [
+                        {"min_quantity": 3, "discount": 60.0}
+                    ]
+                }
+            ],
+        }
+        attrs = {"Mengenrabatt": [{"min_quantity": 3, "discount": 60.0}]}
+        tiers_attr = extract_price_tiers(attr_variant, 119.0, attrs, attr_variant["price"])
+        self.assertEqual(len(tiers_attr), 1)
+        self.assertEqual(tiers_attr[0]["min_quantity"], 3)
+        self.assertEqual(tiers_attr[0]["unit_price_eur"], 59.0)
+
+        # 3. Test compute_optimal_pack_plan
+        item_a = {"article_id": 1001, "name": "Item A", "price_eur": 99.0, "price_tiers": []}
+        item_b = {
+            "article_id": 1002,
+            "name": "Item B",
+            "price_eur": 119.0,
+            "price_tiers": [{"min_quantity": 3, "unit_price_eur": 59.0, "discount_eur": 60.0}],
+        }
+
+        # Need 2 items:
+        # Item A: 2x 99€ = 198€
+        # Item B without discount: 2x 119€ = 238€
+        # Item B hitting Mengenrabatt: 3x 59€ = 177€
+        plan_a = compute_optimal_pack_plan(item_a, 2)
+        plan_b = compute_optimal_pack_plan(item_b, 2)
+
+        self.assertEqual(plan_a, (2, 99.0, 198.0, False))
+        self.assertEqual(plan_b, (3, 59.0, 177.0, True))
+
+        # 4. Test estimate_candidate_pack_plan
+        spec_2x = parse_shopping_item_spec("2x Item")
+        cand_plan_a = estimate_candidate_pack_plan(spec_2x, item_a)
+        cand_plan_b = estimate_candidate_pack_plan(spec_2x, item_b)
+
+        self.assertEqual(cand_plan_a["packs"], 2)
+        self.assertEqual(cand_plan_a["line_total_eur"], 198.0)
+        self.assertFalse(cand_plan_a["tier_applied"])
+
+        self.assertEqual(cand_plan_b["packs"], 3)
+        self.assertEqual(cand_plan_b["line_total_eur"], 177.0)
+        self.assertTrue(cand_plan_b["tier_applied"])
+        self.assertIn("Mengenrabatt", cand_plan_b["base_metric"])
+
+        # 5. Full resolution test through async_resolve_item_for_cart
+        async def _run() -> None:
+            client = FlaschenpostApiClient(email="test@example.com", password="secret")
+            client._warehouse_id = 10
+
+            async def _fake_search(q, **kwargs):
+                return [item_a, item_b]
+
+            client.async_search_products = _fake_search
+
+            # Resolve 2 items: Item B (177€ for 3) must beat Item A (198€ for 2)
+            winner = await client.async_resolve_item_for_cart("Item", target_amount_base=2.0, sort_by="price")
+            self.assertIsNotNone(winner)
+            self.assertEqual(winner["article_id"], 1002)
+            self.assertEqual(winner["quantity"], 3)
+            self.assertEqual(winner["line_total_eur"], 177.0)
+            self.assertEqual(winner["unit_price_eur"], 59.0)
+            self.assertTrue(winner["tier_applied"])
+
+            # Also check preview_search in manager
+            manager = FlaschenpostShoppingListManager(client=client)
+            preview = await manager.async_preview_search("2x Item")
+            self.assertIsNotNone(preview["winner"])
+            self.assertEqual(preview["winner"]["article_id"], 1002)
+            self.assertEqual(preview["winner"]["quantity"], 3)
+            self.assertEqual(preview["winner"]["line_total_eur"], 177.0)
+
+            # Candidates list: Item B must be first, Item A second
+            self.assertEqual(preview["candidates"][0]["article_id"], 1002)
+            self.assertEqual(preview["candidates"][0]["line_total_eur"], 177.0)
+            self.assertEqual(preview["candidates"][1]["article_id"], 1001)
+            self.assertEqual(preview["candidates"][1]["line_total_eur"], 198.0)
 
         asyncio.run(_run())
 

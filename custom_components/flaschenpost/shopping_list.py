@@ -9,7 +9,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .api import FlaschenpostApiClient, extract_negative_keywords
+from .api import (
+    FlaschenpostApiClient,
+    compute_optimal_pack_plan,
+    extract_negative_keywords,
+)
 from .const import (
     DEFAULT_SHOPPING_LIST_NAME,
     ORIGIN_FAVORITES,
@@ -402,38 +406,55 @@ def build_pinned_spec_summary(
 def estimate_candidate_pack_plan(
     spec: ParsedShoppingSpec, product: dict[str, Any]
 ) -> dict[str, Any]:
-    """Calculate how many packs of `product` are required to satisfy `spec` and at what cost."""
+    """Calculate how many packs of `product` are required to satisfy `spec` and at what cost, considering Mengenrabatte."""
     pkg_w = product.get("package_weight_g")
     pkg_v = product.get("package_volume_ml")
-    price_eur = float(product.get("price_eur") or 0.0)
 
     if spec.unit_type == UNIT_TYPE_WEIGHT_G and pkg_w and float(pkg_w) > 0:
-        packs = max(1, math.ceil(spec.target_amount_base / float(pkg_w) - 1e-9))
+        min_packs = max(1, math.ceil(spec.target_amount_base / float(pkg_w) - 1e-9))
+    elif spec.unit_type == UNIT_TYPE_VOLUME_ML and pkg_v and float(pkg_v) > 0:
+        min_packs = max(1, math.ceil(spec.target_amount_base / float(pkg_v) - 1e-9))
+    elif spec.unit_type == UNIT_TYPE_CRATE:
+        min_packs = max(1, math.ceil(spec.target_amount_base - 1e-9))
+    else:
+        min_packs = max(1, math.ceil(spec.target_amount_base - 1e-9))
+
+    packs, eff_unit_price, line_total, tier_applied = compute_optimal_pack_plan(
+        product, min_packs
+    )
+
+    if spec.unit_type == UNIT_TYPE_WEIGHT_G and pkg_w and float(pkg_w) > 0:
         delivered = format_base_amount(UNIT_TYPE_WEIGHT_G, packs * float(pkg_w))
     elif spec.unit_type == UNIT_TYPE_VOLUME_ML and pkg_v and float(pkg_v) > 0:
-        packs = max(1, math.ceil(spec.target_amount_base / float(pkg_v) - 1e-9))
         delivered = format_base_amount(UNIT_TYPE_VOLUME_ML, packs * float(pkg_v))
     elif spec.unit_type == UNIT_TYPE_CRATE:
-        packs = max(1, math.ceil(spec.target_amount_base - 1e-9))
         delivered = format_base_amount(UNIT_TYPE_CRATE, float(packs))
     else:
-        packs = max(1, math.ceil(spec.target_amount_base - 1e-9))
         delivered = f"{packs}x"
 
-    if product.get("price_per_kg_eur") is not None:
+    if tier_applied and pkg_w and float(pkg_w) > 0:
+        eff_kg = round(eff_unit_price / (float(pkg_w) / 1000.0), 2)
+        base_metric = f"{eff_kg:.2f} EUR/kg (Mengenrabatt)"
+    elif product.get("price_per_kg_eur") is not None:
         base_metric = f"{float(product['price_per_kg_eur']):.2f} EUR/kg"
+    elif tier_applied and pkg_v and float(pkg_v) > 0:
+        eff_l = round(eff_unit_price / (float(pkg_v) / 1000.0), 2)
+        base_metric = f"{eff_l:.2f} EUR/L (Mengenrabatt)"
     elif product.get("price_per_liter_eur") is not None:
         base_metric = f"{float(product['price_per_liter_eur']):.2f} EUR/L"
     elif product.get("price_per_unit_eur") is not None:
-        base_metric = f"{float(product['price_per_unit_eur']):.2f} EUR/unit"
+        eff_u = eff_unit_price if tier_applied else float(product["price_per_unit_eur"])
+        base_metric = f"{eff_u:.2f} EUR/unit" + (" (Mengenrabatt)" if tier_applied else "")
     else:
-        base_metric = f"{price_eur:.2f} EUR"
+        base_metric = f"{eff_unit_price:.2f} EUR" + (" (Mengenrabatt)" if tier_applied else "")
 
     return {
         "packs": packs,
         "delivered_amount": delivered,
-        "line_total_eur": round(packs * price_eur, 2),
+        "line_total_eur": line_total,
+        "unit_price_eur": eff_unit_price,
         "base_metric": base_metric,
+        "tier_applied": tier_applied,
         "pinned_summary": build_pinned_spec_summary(spec, product),
     }
 
@@ -1212,7 +1233,8 @@ class FlaschenpostShoppingListManager:
                     "quantity_added": qty,
                     "requested_amount": requested_str,
                     "delivered_amount": delivered_str,
-                    "unit_price_eur": prod.get("price_eur"),
+                    "unit_price_eur": resolution.get("unit_price_eur", prod.get("price_eur")),
+                    "tier_applied": resolution.get("tier_applied", False),
                     "price_per_kg_eur": prod.get("price_per_kg_eur"),
                     "price_per_liter_eur": prod.get("price_per_liter_eur"),
                     "line_total_eur": resolution["line_total_eur"],

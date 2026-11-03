@@ -251,6 +251,180 @@ def matches_category_filter(item: dict[str, Any], category_filter: str | None) -
     return True
 
 
+def extract_price_tiers(
+    variant: dict[str, Any],
+    price_eur: float,
+    attrs: dict[str, Any],
+    price_obj: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Extract normalized quantity discount tiers (Mengenrabatte / Staffelpreise).
+
+    Returns a list of dicts sorted by min_quantity ascending:
+        [{"min_quantity": int, "unit_price_eur": float, "discount_eur": float}, ...]
+    """
+    raw_tiers: list[Any] = []
+
+    if isinstance(price_obj.get("tiers"), list):
+        raw_tiers.extend(price_obj["tiers"])
+
+    for p in variant.get("prices") or []:
+        if isinstance(p, dict) and isinstance(p.get("tiers"), list):
+            raw_tiers.extend(p["tiers"])
+
+    if isinstance(variant.get("price_tiers"), list):
+        raw_tiers.extend(variant["price_tiers"])
+
+    for attr_key in (
+        "TieredPrices",
+        "PriceTiers",
+        "TierPrices",
+        "VolumePrices",
+        "Mengenrabatt",
+        "Staffelpreise",
+        "Gradelpreise",
+    ):
+        attr_val = attrs.get(attr_key)
+        if isinstance(attr_val, list):
+            raw_tiers.extend(attr_val)
+        elif isinstance(attr_val, str) and (
+            attr_val.strip().startswith("[") or attr_val.strip().startswith("{")
+        ):
+            try:
+                parsed = json.loads(attr_val)
+                if isinstance(parsed, list):
+                    raw_tiers.extend(parsed)
+                elif isinstance(parsed, dict):
+                    raw_tiers.append(parsed)
+            except Exception:
+                pass
+
+    out: list[dict[str, Any]] = []
+    seen_qtys: set[int] = set()
+
+    for item in raw_tiers:
+        if not isinstance(item, dict):
+            continue
+
+        min_q = None
+        for q_key in (
+            "minimumQuantity",
+            "min_quantity",
+            "minQuantity",
+            "minQty",
+            "quantity",
+            "from",
+            "ab",
+            "threshold",
+        ):
+            if item.get(q_key) is not None:
+                try:
+                    min_q = int(item[q_key])
+                    break
+                except (ValueError, TypeError):
+                    pass
+        if min_q is None or min_q < 2 or min_q in seen_qtys:
+            continue
+
+        unit_price = None
+        val_obj = item.get("value")
+        if isinstance(val_obj, dict) and "centAmount" in val_obj:
+            unit_price = cents_to_eur(val_obj)
+        elif isinstance(val_obj, (int, float)):
+            unit_price = float(val_obj)
+
+        if unit_price is None:
+            for p_key in (
+                "price_eur",
+                "priceEur",
+                "unit_price",
+                "unit_price_eur",
+                "price",
+            ):
+                if item.get(p_key) is not None:
+                    try:
+                        unit_price = float(item[p_key])
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+        discount_val = None
+        for d_key in (
+            "discount_eur",
+            "discountEur",
+            "discount",
+            "discount_per_unit",
+        ):
+            if item.get(d_key) is not None:
+                try:
+                    discount_val = float(item[d_key])
+                    break
+                except (ValueError, TypeError):
+                    pass
+        if discount_val is None:
+            d_cent = item.get("discountCentAmount") or item.get("discount_cent_amount")
+            if isinstance(d_cent, (int, float)) or (isinstance(d_cent, str) and d_cent.replace(".", "", 1).isdigit()):
+                discount_val = float(d_cent) / 100.0
+
+        if unit_price is None and discount_val is not None:
+            unit_price = round(price_eur - discount_val, 4)
+        elif unit_price is not None and discount_val is None:
+            discount_val = round(price_eur - unit_price, 4)
+
+        if unit_price is not None and 0 < unit_price < price_eur:
+            seen_qtys.add(min_q)
+            out.append(
+                {
+                    "min_quantity": min_q,
+                    "unit_price_eur": round(unit_price, 4),
+                    "discount_eur": round(
+                        discount_val if discount_val is not None else (price_eur - unit_price), 4
+                    ),
+                }
+            )
+
+    out.sort(key=lambda t: t["min_quantity"])
+    return out
+
+
+def compute_optimal_pack_plan(
+    product: dict[str, Any], min_packs: int
+) -> tuple[int, float, float, bool]:
+    """Find the pack quantity >= min_packs that minimizes total line price considering price tiers (Mengenrabatte).
+
+    Returns:
+        (optimal_packs, effective_unit_price_eur, line_total_eur, tier_applied)
+    """
+    regular_price = float(product.get("price_eur") or 0.0)
+    tiers = product.get("price_tiers") or []
+
+    def _unit_price(q: int) -> float:
+        price = regular_price
+        for t in tiers:
+            min_q = int(t.get("min_quantity") or 0)
+            t_price = float(t.get("unit_price_eur") or 0.0)
+            if q >= min_q and 0 < t_price < price:
+                price = t_price
+        return price
+
+    best_packs = max(1, min_packs)
+    best_unit_price = _unit_price(best_packs)
+    best_total = round(best_packs * best_unit_price, 2)
+    tier_hit = best_unit_price < regular_price
+
+    for t in tiers:
+        t_min_q = int(t.get("min_quantity") or 0)
+        if t_min_q > min_packs:
+            t_unit_price = _unit_price(t_min_q)
+            t_total = round(t_min_q * t_unit_price, 2)
+            if t_total < best_total:
+                best_packs = t_min_q
+                best_unit_price = t_unit_price
+                best_total = t_total
+                tier_hit = True
+
+    return best_packs, round(best_unit_price, 4), best_total, tier_hit
+
+
 def extract_variant_summary(
     product: dict[str, Any], variant: dict[str, Any]
 ) -> dict[str, Any]:
@@ -292,6 +466,7 @@ def extract_variant_summary(
         attrs.get("DiscountedPricePerUnitText")
         or price_fields.get("PricePerUnitText")
     )
+    price_tiers = extract_price_tiers(variant, price_eur, attrs, price_obj)
     base_price_eur, base_unit = parse_price_per_unit_text(ppu_text)
 
     article_desc = str(attrs.get("ArticleDescription") or "").strip()
@@ -395,6 +570,7 @@ def extract_variant_summary(
         "is_available": bool(is_available),
         "price_eur": price_eur,
         "regular_price_eur": regular_price_eur,
+        "price_tiers": price_tiers,
         "items_in_frame": items_in_frame,
         "piece_count": piece_count,
         "package_weight_g": package_weight_g,
@@ -1398,7 +1574,7 @@ class FlaschenpostApiClient:
         name_contains: str | None = None,
         negative_keywords: list[str] | None = None,
     ) -> dict[str, Any] | None:
-        """Lazily resolve a shopping list requirement against live warehouse stock, category, and prices."""
+        """Lazily resolve a shopping list requirement against live warehouse stock, category, and prices, supporting Mengenrabatte."""
         clean_query, extracted_neg = extract_negative_keywords(query)
         effective_neg: list[str] = list(
             dict.fromkeys(
@@ -1412,22 +1588,31 @@ class FlaschenpostApiClient:
             pkg_w = chosen.get("package_weight_g")
             pkg_v = chosen.get("package_volume_ml")
             if unit_type == UNIT_TYPE_WEIGHT_G and pkg_w and pkg_w > 0:
-                qty = max(1, math.ceil(target_amount_base / pkg_w - 1e-9))
+                min_p = max(1, math.ceil(target_amount_base / pkg_w - 1e-9))
+            elif unit_type == UNIT_TYPE_VOLUME_ML and pkg_v and pkg_v > 0:
+                min_p = max(1, math.ceil(target_amount_base / pkg_v - 1e-9))
+            else:
+                min_p = max(1, math.ceil(target_amount_base - 1e-9))
+
+            qty, eff_price, line_total, tier_applied = compute_optimal_pack_plan(
+                chosen, min_p
+            )
+            if unit_type == UNIT_TYPE_WEIGHT_G and pkg_w and pkg_w > 0:
                 delivered = round(qty * pkg_w, 1)
             elif unit_type == UNIT_TYPE_VOLUME_ML and pkg_v and pkg_v > 0:
-                qty = max(1, math.ceil(target_amount_base / pkg_v - 1e-9))
                 delivered = round(qty * pkg_v, 1)
             else:
-                qty = max(1, math.ceil(target_amount_base - 1e-9))
                 delivered = float(qty)
-            price_eur = float(chosen.get("price_eur") or 0.0)
+
             return {
                 "article_id": int(article_id),
                 "quantity": qty,
                 "unit_type": unit_type,
                 "requested_amount_base": target_amount_base,
                 "delivered_amount_base": delivered,
-                "line_total_eur": round(qty * price_eur, 2),
+                "line_total_eur": line_total,
+                "unit_price_eur": eff_price,
+                "tier_applied": tier_applied,
                 "product": chosen,
             }
 
@@ -1455,16 +1640,17 @@ class FlaschenpostApiClient:
             if not weighted:
                 return None
 
-            def _packs_w(cand: dict[str, Any]) -> int:
-                return max(
+            def _plan_w(cand: dict[str, Any]) -> tuple[int, float, float, bool]:
+                min_p = max(
                     1,
                     math.ceil(
                         target_amount_base / float(cand["package_weight_g"]) - 1e-9
                     ),
                 )
+                return compute_optimal_pack_plan(cand, min_p)
 
             def _actual_w(cand: dict[str, Any]) -> float:
-                return _packs_w(cand) * float(cand["package_weight_g"])
+                return _plan_w(cand)[0] * float(cand["package_weight_g"])
 
             max_reasonable_g = max(
                 target_amount_base * 2.0, target_amount_base + 500.0
@@ -1476,8 +1662,8 @@ class FlaschenpostApiClient:
             if effective_sort == SORT_PRICE:
                 weighted.sort(
                     key=lambda c: (
-                        round(_packs_w(c) * float(c.get("price_eur") or 1e9), 2),
-                        c.get("price_per_kg_eur") or 1e9,
+                        _plan_w(c)[2],  # line_total_eur
+                        round(_plan_w(c)[1] / (float(c["package_weight_g"]) / 1000.0), 4),  # eff price per kg
                         abs(_actual_w(c) - target_amount_base),
                         int(c.get("article_id") or 0),
                     )
@@ -1485,23 +1671,21 @@ class FlaschenpostApiClient:
             elif effective_sort == SORT_PRICE_PER_KG:
                 weighted.sort(
                     key=lambda c: (
-                        c.get("price_per_kg_eur") is None,
-                        c.get("price_per_kg_eur") or 1e9,
-                        round(_packs_w(c) * float(c.get("price_eur") or 1e9), 2),
+                        round(_plan_w(c)[1] / (float(c["package_weight_g"]) / 1000.0), 4),
+                        _plan_w(c)[2],
                         _actual_w(c) - target_amount_base,
                     )
                 )
             elif effective_sort == SORT_PRICE_PER_UNIT:
                 weighted.sort(
                     key=lambda c: (
-                        c.get("price_per_unit_eur") is None,
-                        c.get("price_per_unit_eur") or 1e9,
-                        round(_packs_w(c) * float(c.get("price_eur") or 1e9), 2),
+                        _plan_w(c)[1],
+                        _plan_w(c)[2],
                     )
                 )
 
             winner = weighted[0]
-            qty = _packs_w(winner)
+            qty, eff_price, line_total, tier_applied = _plan_w(winner)
             delivered = round(_actual_w(winner), 1)
             return {
                 "article_id": int(winner["article_id"]),
@@ -1509,7 +1693,9 @@ class FlaschenpostApiClient:
                 "unit_type": unit_type,
                 "requested_amount_base": target_amount_base,
                 "delivered_amount_base": delivered,
-                "line_total_eur": round(qty * float(winner.get("price_eur") or 0.0), 2),
+                "line_total_eur": line_total,
+                "unit_price_eur": eff_price,
+                "tier_applied": tier_applied,
                 "product": winner,
             }
 
@@ -1537,16 +1723,17 @@ class FlaschenpostApiClient:
             if not volumetric:
                 return None
 
-            def _packs_v(cand: dict[str, Any]) -> int:
-                return max(
+            def _plan_v(cand: dict[str, Any]) -> tuple[int, float, float, bool]:
+                min_p = max(
                     1,
                     math.ceil(
                         target_amount_base / float(cand["package_volume_ml"]) - 1e-9
                     ),
                 )
+                return compute_optimal_pack_plan(cand, min_p)
 
             def _actual_v(cand: dict[str, Any]) -> float:
-                return _packs_v(cand) * float(cand["package_volume_ml"])
+                return _plan_v(cand)[0] * float(cand["package_volume_ml"])
 
             max_reasonable_ml = max(
                 target_amount_base * 2.0, target_amount_base + 1500.0
@@ -1560,8 +1747,8 @@ class FlaschenpostApiClient:
             if effective_sort == SORT_PRICE:
                 volumetric.sort(
                     key=lambda c: (
-                        round(_packs_v(c) * float(c.get("price_eur") or 1e9), 2),
-                        c.get("price_per_liter_eur") or 1e9,
+                        _plan_v(c)[2],  # line_total_eur
+                        round(_plan_v(c)[1] / (float(c["package_volume_ml"]) / 1000.0), 4),  # eff price per liter
                         abs(_actual_v(c) - target_amount_base),
                         int(c.get("article_id") or 0),
                     )
@@ -1569,22 +1756,20 @@ class FlaschenpostApiClient:
             elif effective_sort == SORT_PRICE_PER_LITER:
                 volumetric.sort(
                     key=lambda c: (
-                        c.get("price_per_liter_eur") is None,
-                        c.get("price_per_liter_eur") or 1e9,
-                        round(_packs_v(c) * float(c.get("price_eur") or 1e9), 2),
+                        round(_plan_v(c)[1] / (float(c["package_volume_ml"]) / 1000.0), 4),
+                        _plan_v(c)[2],
                     )
                 )
             elif effective_sort == SORT_PRICE_PER_UNIT:
                 volumetric.sort(
                     key=lambda c: (
-                        c.get("price_per_unit_eur") is None,
-                        c.get("price_per_unit_eur") or 1e9,
-                        round(_packs_v(c) * float(c.get("price_eur") or 1e9), 2),
+                        _plan_v(c)[1],
+                        _plan_v(c)[2],
                     )
                 )
 
             winner = volumetric[0]
-            qty = _packs_v(winner)
+            qty, eff_price, line_total, tier_applied = _plan_v(winner)
             delivered = round(_actual_v(winner), 1)
             return {
                 "article_id": int(winner["article_id"]),
@@ -1592,7 +1777,9 @@ class FlaschenpostApiClient:
                 "unit_type": unit_type,
                 "requested_amount_base": target_amount_base,
                 "delivered_amount_base": delivered,
-                "line_total_eur": round(qty * float(winner.get("price_eur") or 0.0), 2),
+                "line_total_eur": line_total,
+                "unit_price_eur": eff_price,
+                "tier_applied": tier_applied,
                 "product": winner,
             }
 
@@ -1615,11 +1802,15 @@ class FlaschenpostApiClient:
             )
             if not pool:
                 return None
-            qty_crates = max(1, math.ceil(target_amount_base - 1e-9))
+            min_crates = max(1, math.ceil(target_amount_base - 1e-9))
+
+            def _plan_c(cand: dict[str, Any]) -> tuple[int, float, float, bool]:
+                return compute_optimal_pack_plan(cand, min_crates)
+
             if effective_sort == SORT_PRICE:
                 pool.sort(
                     key=lambda c: (
-                        round(qty_crates * float(c.get("price_eur") or 1e9), 2),
+                        _plan_c(c)[2],  # line_total_eur
                         c.get("price_per_liter_eur") or 1e9,
                         int(c.get("article_id") or 0),
                     )
@@ -1629,18 +1820,20 @@ class FlaschenpostApiClient:
                     key=lambda c: (
                         c.get("price_per_liter_eur") is None,
                         c.get("price_per_liter_eur") or 1e9,
-                        round(qty_crates * float(c.get("price_eur") or 1e9), 2),
+                        _plan_c(c)[2],
                     )
                 )
             winner = pool[0]
-            qty = max(1, math.ceil(target_amount_base - 1e-9))
+            qty, eff_price, line_total, tier_applied = _plan_c(winner)
             return {
                 "article_id": int(winner["article_id"]),
                 "quantity": qty,
                 "unit_type": unit_type,
                 "requested_amount_base": target_amount_base,
                 "delivered_amount_base": float(qty),
-                "line_total_eur": round(qty * float(winner.get("price_eur") or 0.0), 2),
+                "line_total_eur": line_total,
+                "unit_price_eur": eff_price,
+                "tier_applied": tier_applied,
                 "product": winner,
             }
 
@@ -1656,15 +1849,37 @@ class FlaschenpostApiClient:
         )
         if not pool:
             return None
+        min_u = max(1, math.ceil(target_amount_base - 1e-9))
+
+        def _plan_u(cand: dict[str, Any]) -> tuple[int, float, float, bool]:
+            return compute_optimal_pack_plan(cand, min_u)
+
+        if effective_sort == SORT_PRICE:
+            pool.sort(
+                key=lambda c: (
+                    _plan_u(c)[2],  # line_total_eur
+                    _plan_u(c)[1],  # unit_price_eur
+                    int(c.get("article_id") or 0),
+                )
+            )
+        elif effective_sort == SORT_PRICE_PER_UNIT:
+            pool.sort(
+                key=lambda c: (
+                    _plan_u(c)[1],  # unit_price_eur
+                    _plan_u(c)[2],  # line_total_eur
+                )
+            )
         winner = pool[0]
-        qty = max(1, math.ceil(target_amount_base - 1e-9))
+        qty, eff_price, line_total, tier_applied = _plan_u(winner)
         return {
             "article_id": int(winner["article_id"]),
             "quantity": qty,
             "unit_type": unit_type,
             "requested_amount_base": target_amount_base,
             "delivered_amount_base": float(qty),
-            "line_total_eur": round(qty * float(winner.get("price_eur") or 0.0), 2),
+            "line_total_eur": line_total,
+            "unit_price_eur": eff_price,
+            "tier_applied": tier_applied,
             "product": winner,
         }
 

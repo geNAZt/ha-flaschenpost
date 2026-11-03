@@ -534,9 +534,13 @@ class FlaschenpostView extends HTMLElement {
         ? `${Number(w.product.price_per_kg_eur).toFixed(2)} €/kg`
         : `${Number(w.product.price_eur || 0).toFixed(2)} €`;
 
+      const isMengenrabatt = w.tier_applied || (w.product && w.product.tier_applied);
       winnerHtml = `
         <div class="winner-banner">
-          <div class="winner-badge">★ Order-Time Winner</div>
+          <div style="display:flex; align-items:center; gap:6px;">
+            <span class="winner-badge">★ Order-Time Winner</span>
+            ${isMengenrabatt ? `<span style="background:#e8f5e9; color:#2e7d32; font-size:0.75rem; font-weight:800; padding:2px 8px; border-radius:12px; text-transform:uppercase;">Mengenrabatt</span>` : ""}
+          </div>
           <div style="font-weight: 700; font-size: 1.05rem;">
             ${w.quantity}x ${w.product.name} (#${w.article_id})
           </div>
@@ -576,7 +580,8 @@ class FlaschenpostView extends HTMLElement {
                   <tr>
                     <td><code>#${c.article_id}</code></td>
                     <td>
-                      <strong>${c.name}</strong><br />
+                      <strong>${c.name}</strong>
+                      ${c.tier_applied ? `<span style="background:#e8f5e9; color:#2e7d32; font-size:0.72rem; font-weight:700; padding:1px 5px; border-radius:4px; margin-left:4px;" title="Günstigerer Mengenrabatt greift">Mengenrabatt</span>` : ""}<br />
                       <span style="font-size:0.75rem; color:#888;">${(c.categories || []).slice(0, 2).join(" > ")}</span>
                     </td>
                     <td>${c.description || "1x"} (${Number(c.price_eur || 0).toFixed(2)} €)</td>
