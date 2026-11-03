@@ -187,6 +187,7 @@ async def _async_fetch_external_ha_todo_items(
 
 PANEL_URL_PATH = "flaschenpost"
 FRONTEND_URL = "/flaschenpost_static"
+PANEL_JS_VERSION = "2.0.1"
 
 
 async def _async_register_frontend_panel(hass: HomeAssistant) -> None:
@@ -216,7 +217,7 @@ async def _async_register_frontend_panel(hass: HomeAssistant) -> None:
         from homeassistant.components import frontend
 
         if hasattr(frontend, "add_extra_js_url"):
-            frontend.add_extra_js_url(hass, f"{FRONTEND_URL}/flaschenpost-panel.js")
+            frontend.add_extra_js_url(hass, f"{FRONTEND_URL}/flaschenpost-panel.js?v={PANEL_JS_VERSION}")
     except Exception as err:
         _LOGGER.debug("Could not register extra js url: %s", err)
 
@@ -232,7 +233,7 @@ async def _async_register_frontend_panel(hass: HomeAssistant) -> None:
                 webcomponent_name="flaschenpost-panel",
                 sidebar_title="Flaschenpost",
                 sidebar_icon="mdi:cart-outline",
-                module_url=f"{FRONTEND_URL}/flaschenpost-panel.js",
+                module_url=f"{FRONTEND_URL}/flaschenpost-panel.js?v={PANEL_JS_VERSION}",
                 require_admin=False,
             )
     except Exception as err:

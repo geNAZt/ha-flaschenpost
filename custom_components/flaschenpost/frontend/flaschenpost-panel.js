@@ -1,12 +1,14 @@
 /**
  * Flaschenpost Interactive Shopping List Panel & Lovelace Card
  * Custom Web Component for Home Assistant
+ * Version: 2.0.1
  */
 
 class FlaschenpostView extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
+    this._domCreated = false;
     this._hass = null;
     this._config = {};
     this._activeList = "Einkaufsliste";
@@ -37,9 +39,14 @@ class FlaschenpostView extends HTMLElement {
     this._actionMessage = null;
   }
 
+  connectedCallback() {
+    this._ensureDom();
+  }
+
   set hass(hass) {
     const firstSet = !this._hass;
     this._hass = hass;
+    this._ensureDom();
     if (firstSet) {
       this._loadInitialData();
     }
@@ -60,7 +67,10 @@ class FlaschenpostView extends HTMLElement {
       this._fetchCategories(),
       this._fetchCart(),
     ]);
-    this.render();
+    this._updateCartUi();
+    this._updateTabsUi();
+    this._updateListItemsUi();
+    this._updateCategoryOptionsUi();
   }
 
   async _fetchLists() {
@@ -176,7 +186,6 @@ class FlaschenpostView extends HTMLElement {
       this._negativeKeywords.splice(idx, 1);
     } else {
       this._negativeKeywords.push(clean);
-      // Remove from positive if present
       this._positiveKeywords = this._positiveKeywords.filter((k) => k.toLowerCase() !== clean.toLowerCase());
     }
     this._updateChips();
@@ -190,7 +199,6 @@ class FlaschenpostView extends HTMLElement {
       this._positiveKeywords.splice(idx, 1);
     } else {
       this._positiveKeywords.push(clean);
-      // Remove from negative if present
       this._negativeKeywords = this._negativeKeywords.filter((k) => k.toLowerCase() !== clean.toLowerCase());
     }
     this._updateChips();
@@ -237,7 +245,10 @@ class FlaschenpostView extends HTMLElement {
       }
       this._clearBuilder();
       await this._fetchLists();
-      this.render();
+      this._updateBuilderUi();
+      this._updateListItemsUi();
+      this._updateTabsUi();
+      this._updatePreview();
     } catch (err) {
       this._showToast(`Fehler: ${err.message || err}`, true);
     }
@@ -265,7 +276,8 @@ class FlaschenpostView extends HTMLElement {
         completed: !item.completed,
       });
       await this._fetchLists();
-      this.render();
+      this._updateListItemsUi();
+      this._updateTabsUi();
     } catch (err) {
       this._showToast(`Fehler: ${err.message || err}`, true);
     }
@@ -281,7 +293,8 @@ class FlaschenpostView extends HTMLElement {
       });
       this._showToast("Eintrag gelöscht");
       await this._fetchLists();
-      this.render();
+      this._updateListItemsUi();
+      this._updateTabsUi();
     } catch (err) {
       this._showToast(`Fehler: ${err.message || err}`, true);
     }
@@ -319,9 +332,12 @@ class FlaschenpostView extends HTMLElement {
       this._unit = "x";
     }
 
-    this.render();
+    this._updateBuilderUi();
     this._triggerSearchDebounced();
-    this.shadowRoot.getElementById("search-input")?.focus();
+    const searchInput = this.shadowRoot.getElementById("search-input");
+    if (searchInput) {
+      searchInput.focus();
+    }
   }
 
   async _createNewList() {
@@ -336,7 +352,9 @@ class FlaschenpostView extends HTMLElement {
       });
       this._activeList = clean;
       await this._fetchLists();
-      this.render();
+      this._updateTabsUi();
+      this._updateListItemsUi();
+      this._updateBuilderUi();
       this._showToast(`Liste '${clean}' erstellt!`);
     } catch (err) {
       this._showToast(`Fehler: ${err.message || err}`, true);
@@ -358,7 +376,9 @@ class FlaschenpostView extends HTMLElement {
       });
       this._activeList = this._listNames.find((n) => n !== this._activeList) || "Einkaufsliste";
       await this._fetchLists();
-      this.render();
+      this._updateTabsUi();
+      this._updateListItemsUi();
+      this._updateBuilderUi();
       this._showToast("Liste gelöscht");
     } catch (err) {
       this._showToast(`Fehler: ${err.message || err}`, true);
@@ -375,7 +395,7 @@ class FlaschenpostView extends HTMLElement {
       });
       this._dryRunResult = resp;
       this._showDryRunModal = true;
-      this.render();
+      this._updateModalsUi();
     } catch (err) {
       this._showToast(`Fehler: ${err.message || err}`, true);
     }
@@ -393,8 +413,9 @@ class FlaschenpostView extends HTMLElement {
       });
       await this._fetchCart();
       this._showDryRunModal = false;
+      this._updateCartUi();
+      this._updateModalsUi();
       this._showToast(`${resp.synced_count || 0} Artikel in Warenkorb übertragen!`);
-      this.render();
     } catch (err) {
       this._showToast(`Fehler: ${err.message || err}`, true);
     }
@@ -406,7 +427,7 @@ class FlaschenpostView extends HTMLElement {
       return;
     }
     this._buyLoading = true;
-    this.render();
+    this._updateModalsUi();
     try {
       const resp = await this._hass.callWS({
         type: "flaschenpost/buy_cart",
@@ -416,11 +437,12 @@ class FlaschenpostView extends HTMLElement {
       this._buyConfirmChecked = false;
       this._showToast(`Bestellung #${resp.order_number || resp.order_id} erfolgreich aufgegeben! 🎉`);
       await this._fetchCart();
+      this._updateCartUi();
     } catch (err) {
       this._showToast(`Bestellfehler: ${err.message || err}`, true);
     } finally {
       this._buyLoading = false;
-      this.render();
+      this._updateModalsUi();
     }
   }
 
@@ -527,6 +549,12 @@ class FlaschenpostView extends HTMLElement {
       return "";
     }
 
+    const activeCat = this._category || (this._preview && this._preview.spec && this._preview.spec.category) || "";
+    const catBadge = activeCat ? `<span class="badge-cat" title="Kategorie-Filter aktiv">📁 ${activeCat}</span>` : "";
+    const previewTitle = this._preview && this._preview.lazy_summary
+      ? this._preview.lazy_summary
+      : (activeCat ? `${activeCat}::${queryWithKws}` : queryWithKws);
+
     let winnerHtml = "";
     if (this._preview && this._preview.winner && this._preview.winner.product) {
       const w = this._preview.winner;
@@ -535,18 +563,20 @@ class FlaschenpostView extends HTMLElement {
         : `${Number(w.product.price_eur || 0).toFixed(2)} €`;
 
       const isMengenrabatt = w.tier_applied || (w.product && w.product.tier_applied);
+      const winnerCats = (w.product && w.product.categories ? w.product.categories.join(" > ") : "") || "—";
       winnerHtml = `
         <div class="winner-banner">
-          <div style="display:flex; align-items:center; gap:6px;">
+          <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
             <span class="winner-badge">★ Order-Time Winner</span>
-            ${isMengenrabatt ? `<span style="background:#e8f5e9; color:#2e7d32; font-size:0.75rem; font-weight:800; padding:2px 8px; border-radius:12px; text-transform:uppercase;">Mengenrabatt</span>` : ""}
+            ${isMengenrabatt ? `<span class="badge-mengenrabatt">Mengenrabatt</span>` : ""}
+            ${activeCat ? `<span class="badge-cat-sm">📁 ${activeCat}</span>` : ""}
           </div>
-          <div style="font-weight: 700; font-size: 1.05rem;">
+          <div style="font-weight: 700; font-size: 1.05rem; margin-top: 4px;">
             ${w.quantity}x ${w.product.name} (#${w.article_id})
           </div>
-          <div style="font-size: 0.88rem; color: #555;">
+          <div style="font-size: 0.88rem; color: #555; margin-top: 2px;">
             Geliefert: <strong>${w.delivered_amount_base || ""}</strong> für <strong>${(w.line_total_eur || 0).toFixed(2)} €</strong>
-            (${priceMetric})
+            (${priceMetric}${winnerCats !== "—" ? `, Kategorie: <em>${winnerCats}</em>` : ""})
           </div>
         </div>
       `;
@@ -565,6 +595,7 @@ class FlaschenpostView extends HTMLElement {
               <tr>
                 <th>#SKU</th>
                 <th>Produkt</th>
+                <th>Kategorie</th>
                 <th>Packung</th>
                 <th>Grundpreis</th>
                 <th>Bedarf -> Summe</th>
@@ -576,14 +607,15 @@ class FlaschenpostView extends HTMLElement {
               ${this._preview.candidates
                 .map((c) => {
                   const isWinner = this._preview.winner && this._preview.winner.article_id === c.article_id;
+                  const candCats = (c.categories || []).slice(0, 2).join(" > ") || "—";
                   return `
                   <tr>
                     <td><code>#${c.article_id}</code></td>
                     <td>
                       <strong>${c.name}</strong>
-                      ${c.tier_applied ? `<span style="background:#e8f5e9; color:#2e7d32; font-size:0.72rem; font-weight:700; padding:1px 5px; border-radius:4px; margin-left:4px;" title="Günstigerer Mengenrabatt greift">Mengenrabatt</span>` : ""}<br />
-                      <span style="font-size:0.75rem; color:#888;">${(c.categories || []).slice(0, 2).join(" > ")}</span>
+                      ${c.tier_applied ? `<span class="badge-mengenrabatt" title="Günstigerer Mengenrabatt greift">Mengenrabatt</span>` : ""}
                     </td>
+                    <td><span style="font-size:0.78rem; color:#666;">${candCats}</span></td>
                     <td>${c.description || "1x"} (${Number(c.price_eur || 0).toFixed(2)} €)</td>
                     <td><strong>${c.base_metric || "-"}</strong></td>
                     <td>${c.packs}x (${c.delivered_amount}) = <strong>${Number(c.line_total_eur || 0).toFixed(2)} €</strong></td>
@@ -615,8 +647,11 @@ class FlaschenpostView extends HTMLElement {
 
     return `
       <div class="panel-card">
-        <div class="card-title">
-          <span>Warehouse Live Preview für: <em>${queryWithKws}</em></span>
+        <div class="card-title" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <span>Warehouse Live Preview für: <em>${previewTitle}</em></span>
+            ${catBadge}
+          </div>
           ${this._isSearching ? `<span style="font-size:0.8rem; color:#888;">Suche läuft...</span>` : ""}
         </div>
         ${winnerHtml}
@@ -644,20 +679,425 @@ class FlaschenpostView extends HTMLElement {
     this._bindPreviewEvents();
   }
 
-  render() {
-    // Preserve focused element and text selection
-    const activeEl = this.shadowRoot ? this.shadowRoot.activeElement : null;
-    const activeId = activeEl ? activeEl.id : null;
-    const selStart = (activeEl && typeof activeEl.selectionStart === "number") ? activeEl.selectionStart : null;
-    const selEnd = (activeEl && typeof activeEl.selectionEnd === "number") ? activeEl.selectionEnd : null;
+  _updateCartUi() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const container = root.getElementById("cart-status-card");
+    if (!container) return;
+
+    const cartTotal = this._cart ? this._cart.total_eur : 0;
+    const minOrder = this._cart ? this._cart.min_order_value_eur : 25.0;
+    const minOrderPercent = Math.min(100, Math.round(((cartTotal || 0) / (minOrder || 25.0)) * 100));
+    const isReached = this._cart && this._cart.min_order_reached;
+
+    container.innerHTML = `
+      <div class="cart-pill">
+        Warenkorb: <strong>${(cartTotal || 0).toFixed(2)} €</strong>
+      </div>
+      <div title="Mindestbestellwert: ${minOrder.toFixed(2)} €">
+        <div style="font-size:0.75rem; color:var(--secondary-text-color,#666); margin-bottom:2px;">
+          ${isReached ? "Mindestbestellwert erreicht! ✓" : `Noch ${(this._cart ? this._cart.remaining_to_min_eur : 0).toFixed(2)} €`}
+        </div>
+        <div class="min-order-bar">
+          <div class="min-order-fill" style="width: ${minOrderPercent}%; background: ${isReached ? "#4caf50" : "#ff9800"};"></div>
+        </div>
+      </div>
+      <div class="cart-actions">
+        <button class="btn-outline" id="btn-dryrun-cart">🔍 Live Vorschau</button>
+        <button class="btn-primary" id="btn-sync-cart">📥 In Warenkorb</button>
+        <button class="btn-success" id="btn-buy-modal">⚡ Bestellen</button>
+      </div>
+    `;
+
+    const btnDryRun = container.querySelector("#btn-dryrun-cart");
+    if (btnDryRun) {
+      btnDryRun.addEventListener("click", () => this._runDryRunPreview());
+    }
+
+    const btnSyncCart = container.querySelector("#btn-sync-cart");
+    if (btnSyncCart) {
+      btnSyncCart.addEventListener("click", () => this._syncToCart(false));
+    }
+
+    const btnBuyModal = container.querySelector("#btn-buy-modal");
+    if (btnBuyModal) {
+      btnBuyModal.addEventListener("click", () => {
+        this._showBuyModal = true;
+        this._updateModalsUi();
+      });
+    }
+  }
+
+  _updateTabsUi() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const tabsContainer = root.getElementById("tabs-row");
+    if (!tabsContainer) return;
+
+    tabsContainer.innerHTML = `
+      ${this._listNames
+        .map((lname) => {
+          const count = (this._lists[lname] || []).filter((i) => !i.completed).length;
+          const activeCls = lname === this._activeList ? "active" : "";
+          return `
+            <button class="tab-btn ${activeCls}" data-list-name="${lname}">
+              ${lname} (${count})
+            </button>
+          `;
+        })
+        .join("")}
+      <button class="btn-outline" id="btn-add-list">+ Neue Liste</button>
+      ${
+        this._listNames.length > 1
+          ? `<button class="btn-outline btn-danger" id="btn-delete-list" title="Aktive Liste löschen">🗑</button>`
+          : ""
+      }
+    `;
+
+    tabsContainer.querySelectorAll(".tab-btn[data-list-name]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this._activeList = btn.dataset.listName;
+        this._updateTabsUi();
+        this._updateListItemsUi();
+        this._updateBuilderUi();
+      });
+    });
+
+    const btnAddList = tabsContainer.querySelector("#btn-add-list");
+    if (btnAddList) {
+      btnAddList.addEventListener("click", () => this._createNewList());
+    }
+
+    const btnDelList = tabsContainer.querySelector("#btn-delete-list");
+    if (btnDelList) {
+      btnDelList.addEventListener("click", () => this._deleteCurrentList());
+    }
+  }
+
+  _updateListItemsUi() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const cardTitleSpan = root.querySelector("#active-list-card .card-title span");
+    const container = root.getElementById("list-items-container");
+    if (!container) return;
 
     const listItems = (this._lists && this._lists[this._activeList]) || [];
     const openItems = listItems.filter((it) => !it.completed);
     const completedItems = listItems.filter((it) => it.completed);
 
+    if (cardTitleSpan) {
+      cardTitleSpan.textContent = `📋 ${this._activeList} (${openItems.length} offen, ${completedItems.length} erledigt)`;
+    }
+
+    if (listItems.length === 0) {
+      container.innerHTML = `<div style="padding: 24px; text-align: center; color: #888;">Diese Liste ist noch leer. Nutze die Suche links, um Artikel hinzuzufügen!</div>`;
+      return;
+    }
+
+    container.innerHTML = `
+      <table class="list-items-table">
+        <tbody>
+          ${openItems
+            .map(
+              (item) => `
+            <tr>
+              <td style="width: 32px;">
+                <input type="checkbox" class="chk-item" data-uid="${item.uid}" />
+              </td>
+              <td>
+                <div class="item-text">${item.summary}</div>
+                ${item.last_resolved_note ? `<div class="item-note">💡 ${item.last_resolved_note}</div>` : ""}
+              </td>
+              <td style="text-align: right; white-space: nowrap;">
+                <button class="btn-outline btn-edit-item" data-uid="${item.uid}" style="padding: 4px 8px; font-size: 0.8rem;">✏️</button>
+                <button class="btn-outline btn-del-item" data-uid="${item.uid}" style="padding: 4px 8px; font-size: 0.8rem; color: #d32f2f;">✕</button>
+              </td>
+            </tr>
+          `
+            )
+            .join("")}
+
+          ${
+            completedItems.length > 0
+              ? `
+            <tr>
+              <td colspan="3" style="padding-top: 16px; font-size: 0.8rem; font-weight: 700; color: #888; text-transform: uppercase;">
+                Erledigt (${completedItems.length})
+              </td>
+            </tr>
+            ${completedItems
+              .map(
+                (item) => `
+              <tr>
+                <td style="width: 32px;">
+                  <input type="checkbox" checked class="chk-item" data-uid="${item.uid}" />
+                </td>
+                <td>
+                  <div class="item-text completed">${item.summary}</div>
+                </td>
+                <td style="text-align: right; white-space: nowrap;">
+                  <button class="btn-outline btn-del-item" data-uid="${item.uid}" style="padding: 4px 8px; font-size: 0.8rem; color: #d32f2f;">✕</button>
+                </td>
+              </tr>
+            `
+              )
+              .join("")}
+          `
+              : ""
+          }
+        </tbody>
+      </table>
+    `;
+
+    container.querySelectorAll(".chk-item[data-uid]").forEach((chk) => {
+      chk.addEventListener("change", () => {
+        const item = (this._lists[this._activeList] || []).find((it) => it.uid === chk.dataset.uid);
+        if (item) this._toggleItemCompleted(item);
+      });
+    });
+
+    container.querySelectorAll(".btn-edit-item[data-uid]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const item = (this._lists[this._activeList] || []).find((it) => it.uid === btn.dataset.uid);
+        if (item) this._loadItemIntoBuilder(item);
+      });
+    });
+
+    container.querySelectorAll(".btn-del-item[data-uid]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const item = (this._lists[this._activeList] || []).find((it) => it.uid === btn.dataset.uid);
+        if (item) this._deleteItem(item);
+      });
+    });
+  }
+
+  _updateCategoryOptionsUi() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const catSelect = root.getElementById("category-select");
+    if (!catSelect) return;
+
+    let optsHtml = '<option value="">Alle Kategorien</option>';
+    if (this._categories && this._categories.length > 0) {
+      optsHtml += this._categories
+        .map(
+          (c) => `<option value="${c.value}" ${this._category === c.value ? "selected" : ""}>${c.label}</option>`
+        )
+        .join("");
+    }
+    catSelect.innerHTML = optsHtml;
+    catSelect.value = this._category || "";
+  }
+
+  _updateBuilderUi() {
+    const root = this.shadowRoot;
+    if (!root) return;
+
+    const searchInput = root.getElementById("search-input");
+    if (searchInput && searchInput.value !== (this._query || "")) {
+      searchInput.value = this._query || "";
+    }
+
+    const amountInput = root.getElementById("amount-input");
+    if (amountInput && Number(amountInput.value) !== Number(this._amount || 1)) {
+      amountInput.value = this._amount || 1;
+    }
+
+    const unitSelect = root.getElementById("unit-select");
+    if (unitSelect && unitSelect.value !== (this._unit || "x")) {
+      unitSelect.value = this._unit || "x";
+    }
+
+    const sortSelect = root.getElementById("sort-select");
+    if (sortSelect && sortSelect.value !== (this._sort || "price")) {
+      sortSelect.value = this._sort || "price";
+    }
+
+    const catSelect = root.getElementById("category-select");
+    if (catSelect && catSelect.value !== (this._category || "")) {
+      catSelect.value = this._category || "";
+    }
+
+    const builderTitle = root.getElementById("builder-title");
+    if (builderTitle) {
+      builderTitle.textContent = this._editingUid ? "✏️ Eintrag bearbeiten" : "🔍 Artikel suchen & konfigurieren";
+    }
+
+    const btnCancel = root.getElementById("btn-cancel-edit");
+    if (btnCancel) {
+      btnCancel.style.display = this._editingUid ? "inline-flex" : "none";
+    }
+
+    const btnSave = root.getElementById("btn-save-builder");
+    if (btnSave) {
+      btnSave.textContent = this._editingUid ? "💾 Eintrag aktualisieren" : `➕ Zu '${this._activeList}' hinzufügen`;
+    }
+
+    this._updateChips();
+  }
+
+  _updateModalsUi() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const container = root.getElementById("modals-container");
+    if (!container) return;
+
     const cartTotal = this._cart ? this._cart.total_eur : 0;
-    const minOrder = this._cart ? this._cart.min_order_value_eur : 25.0;
-    const minOrderPercent = Math.min(100, Math.round((cartTotal / (minOrder || 25.0)) * 100));
+
+    let dryRunHtml = "";
+    if (this._showDryRunModal && this._dryRunResult) {
+      dryRunHtml = `
+        <div class="modal-overlay" id="modal-overlay-dryrun">
+          <div class="modal-box">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+              <h2 style="margin: 0; font-size: 1.25rem;">Live Resolution Vorschau (${this._dryRunResult.lists_merged ? this._dryRunResult.lists_merged.join(", ") : ""})</h2>
+              <button class="btn-outline" id="btn-close-dryrun">✕</button>
+            </div>
+
+            <div style="margin-bottom: 16px; font-size: 1.05rem;">
+              Geschätzter Warenwert: <strong>${(this._dryRunResult.estimated_goods_eur || 0).toFixed(2)} €</strong>
+            </div>
+
+            <div style="overflow-x: auto; max-height: 45vh;">
+              <table class="candidate-table">
+                <thead>
+                  <tr>
+                    <th>Anfrage</th>
+                    <th>Gewähltes Produkt</th>
+                    <th>Menge</th>
+                    <th>Grundpreis</th>
+                    <th>Gesamt</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${(this._dryRunResult.resolved_items || [])
+                    .map(
+                      (r) => `
+                    <tr>
+                      <td><code>${r.requested}</code></td>
+                      <td><strong>${r.name}</strong><br /><span style="font-size:0.75rem; color:#888;">#${r.article_id}</span></td>
+                      <td>${r.quantity_added}x (${r.delivered_amount})</td>
+                      <td>${r.price_per_kg_eur ? `${Number(r.price_per_kg_eur).toFixed(2)} €/kg` : `${Number(r.unit_price_eur || 0).toFixed(2)} €`}</td>
+                      <td><strong>${Number(r.line_total_eur || 0).toFixed(2)} €</strong></td>
+                    </tr>
+                  `
+                    )
+                    .join("")}
+                </tbody>
+              </table>
+            </div>
+
+            ${
+              this._dryRunResult.unresolved && this._dryRunResult.unresolved.length > 0
+                ? `
+              <div style="margin-top: 14px; padding: 10px 14px; background: #ffebee; border-radius: 8px; color: #c62828; font-size: 0.85rem;">
+                <strong>Nicht auflösbar / Ausverkauft:</strong> ${this._dryRunResult.unresolved.join(", ")}
+              </div>
+            `
+                : ""
+            }
+
+            <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;">
+              <button class="btn-secondary" id="btn-sync-replace">Warenkorb leeren & neu füllen</button>
+              <button class="btn-primary" id="btn-sync-append">Zu aktuellem Warenkorb hinzufügen</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    let buyHtml = "";
+    if (this._showBuyModal) {
+      buyHtml = `
+        <div class="modal-overlay" id="modal-overlay-buy">
+          <div class="modal-box">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+              <h2 style="margin: 0; font-size: 1.25rem; color: #2e7d32;">⚡ Flaschenpost Bestellung aufgeben</h2>
+              <button class="btn-outline" id="btn-close-buy">✕</button>
+            </div>
+
+            <div style="background: var(--secondary-background-color, #f9f9f9); padding: 16px; border-radius: 8px; margin-bottom: 16px;">
+              <div style="font-size: 1.1rem; font-weight: 700; margin-bottom: 8px;">
+                Warenkorb Gesamtsumme: ${(cartTotal || 0).toFixed(2)} €
+              </div>
+              <div style="font-size: 0.9rem; color: #666;">
+                Enthaltene Artikel: ${this._cart && this._cart.items ? this._cart.items.length : 0}
+              </div>
+            </div>
+
+            <div style="margin: 16px 0;">
+              <label style="display: flex; align-items: center; gap: 8px; font-size: 0.95rem; cursor: pointer;">
+                <input type="checkbox" id="chk-buy-confirm" ${this._buyConfirmChecked ? "checked" : ""} />
+                <strong>Ich bestätige die kostenpflichtige Bestellung bei Flaschenpost.</strong>
+              </label>
+            </div>
+
+            <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;">
+              <button class="btn-secondary" id="btn-cancel-buy">Abbrechen</button>
+              <button class="btn-success" id="btn-submit-buy" ${!this._buyConfirmChecked || this._buyLoading ? "disabled" : ""}>
+                ${this._buyLoading ? "Bestellung wird gesendet..." : "Jetzt kostenpflichtig bestellen"}
+              </button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    container.innerHTML = `${dryRunHtml}${buyHtml}`;
+
+    const btnCloseDryRun = container.querySelector("#btn-close-dryrun");
+    if (btnCloseDryRun) {
+      btnCloseDryRun.addEventListener("click", () => {
+        this._showDryRunModal = false;
+        this._updateModalsUi();
+      });
+    }
+
+    const btnSyncReplace = container.querySelector("#btn-sync-replace");
+    if (btnSyncReplace) {
+      btnSyncReplace.addEventListener("click", () => this._syncToCart(true));
+    }
+
+    const btnSyncAppend = container.querySelector("#btn-sync-append");
+    if (btnSyncAppend) {
+      btnSyncAppend.addEventListener("click", () => this._syncToCart(false));
+    }
+
+    const btnCloseBuy = container.querySelector("#btn-close-buy");
+    const btnCancelBuy = container.querySelector("#btn-cancel-buy");
+    if (btnCloseBuy) {
+      btnCloseBuy.addEventListener("click", () => {
+        this._showBuyModal = false;
+        this._updateModalsUi();
+      });
+    }
+    if (btnCancelBuy) {
+      btnCancelBuy.addEventListener("click", () => {
+        this._showBuyModal = false;
+        this._updateModalsUi();
+      });
+    }
+
+    const chkBuyConfirm = container.querySelector("#chk-buy-confirm");
+    if (chkBuyConfirm) {
+      chkBuyConfirm.addEventListener("change", (e) => {
+        this._buyConfirmChecked = e.target.checked;
+        const btnSubmit = container.querySelector("#btn-submit-buy");
+        if (btnSubmit) {
+          btnSubmit.disabled = !this._buyConfirmChecked || this._buyLoading;
+        }
+      });
+    }
+
+    const btnSubmitBuy = container.querySelector("#btn-submit-buy");
+    if (btnSubmitBuy) {
+      btnSubmitBuy.addEventListener("click", () => this._executeBuyCart());
+    }
+  }
+
+  _ensureDom() {
+    if (this._domCreated) return;
+    this._domCreated = true;
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -723,8 +1163,6 @@ class FlaschenpostView extends HTMLElement {
 
         .min-order-fill {
           height: 100%;
-          background: ${this._cart && this._cart.min_order_reached ? "#4caf50" : "#ff9800"};
-          width: ${minOrderPercent}%;
           transition: width 0.3s ease;
         }
 
@@ -956,6 +1394,37 @@ class FlaschenpostView extends HTMLElement {
           text-transform: uppercase;
         }
 
+        .badge-cat {
+          background: #e0f2fe;
+          color: #0284c7;
+          font-size: 0.75rem;
+          font-weight: 700;
+          padding: 3px 8px;
+          border-radius: 6px;
+          border: 1px solid rgba(2, 132, 199, 0.3);
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+        }
+        .badge-cat-sm {
+          background: #e0f2fe;
+          color: #0284c7;
+          font-size: 0.72rem;
+          font-weight: 700;
+          padding: 1px 6px;
+          border-radius: 4px;
+        }
+        .badge-mengenrabatt {
+          background: #e8f5e9;
+          color: #2e7d32;
+          font-size: 0.72rem;
+          font-weight: 700;
+          padding: 1px 6px;
+          border-radius: 4px;
+          margin-left: 4px;
+          text-transform: uppercase;
+        }
+
         .candidate-table {
           width: 100%;
           border-collapse: collapse;
@@ -1073,92 +1542,47 @@ class FlaschenpostView extends HTMLElement {
       </style>
 
       <!-- Toast container -->
-      <div id="toast-container">
-        ${
-          this._actionMessage
-            ? `<div class="toast ${this._actionMessage.isError ? "error" : "success"}">${this._actionMessage.text}</div>`
-            : ""
-        }
-      </div>
+      <div id="toast-container"></div>
 
       <!-- Top Header & Cart summary -->
       <div class="header-bar">
         <div class="brand-title">
           <span>🛒</span> Flaschenpost Einkaufslisten
         </div>
-        <div class="cart-status-card">
-          <div class="cart-pill">
-            Warenkorb: <strong>${(cartTotal || 0).toFixed(2)} €</strong>
-          </div>
-          <div title="Mindestbestellwert: ${minOrder.toFixed(2)} €">
-            <div style="font-size:0.75rem; color:var(--secondary-text-color,#666); margin-bottom:2px;">
-              ${this._cart && this._cart.min_order_reached ? "Mindestbestellwert erreicht! ✓" : `Noch ${(this._cart ? this._cart.remaining_to_min_eur : 0).toFixed(2)} €`}
-            </div>
-            <div class="min-order-bar">
-              <div class="min-order-fill"></div>
-            </div>
-          </div>
-          <div class="cart-actions">
-            <button class="btn-outline" id="btn-dryrun-cart">🔍 Live Vorschau</button>
-            <button class="btn-primary" id="btn-sync-cart">📥 In Warenkorb</button>
-            <button class="btn-success" id="btn-buy-modal">⚡ Bestellen</button>
-          </div>
-        </div>
+        <div class="cart-status-card" id="cart-status-card"></div>
       </div>
 
       <!-- Named Lists Tabs -->
-      <div class="tabs-row">
-        ${this._listNames
-          .map((lname) => {
-            const count = (this._lists[lname] || []).filter((i) => !i.completed).length;
-            const activeCls = lname === this._activeList ? "active" : "";
-            return `
-              <button class="tab-btn ${activeCls}" data-list-name="${lname}">
-                ${lname} (${count})
-              </button>
-            `;
-          })
-          .join("")}
-        <button class="btn-outline" id="btn-add-list">+ Neue Liste</button>
-        ${
-          this._listNames.length > 1
-            ? `<button class="btn-outline btn-danger" id="btn-delete-list" title="Aktive Liste löschen">🗑</button>`
-            : ""
-        }
-      </div>
+      <div class="tabs-row" id="tabs-row"></div>
 
       <!-- Main Layout: Left = Builder, Right = List items & Preview -->
       <div class="layout-grid">
-        <!-- Search & Interactive Builder Panel -->
+        <!-- Search & Interactive Builder Panel (DOM Nodes NEVER Rebuilt) -->
         <div class="panel-card">
           <div class="card-title">
-            <span>${this._editingUid ? "✏️ Eintrag bearbeiten" : "🔍 Artikel suchen & konfigurieren"}</span>
-            ${
-              this._editingUid
-                ? `<button class="btn-outline" style="font-size:0.75rem; padding:4px 8px;" id="btn-cancel-edit">Abbrechen</button>`
-                : ""
-            }
+            <span id="builder-title">🔍 Artikel suchen & konfigurieren</span>
+            <button class="btn-outline" style="font-size:0.75rem; padding:4px 8px; display:none;" id="btn-cancel-edit">Abbrechen</button>
           </div>
 
           <div class="form-group">
             <label for="search-input">Produktbegriff</label>
-            <input type="text" id="search-input" placeholder="z.B. Heidelbeeren, Hafermilch, Cola..." value="${this._query || ""}" />
+            <input type="text" id="search-input" placeholder="z.B. Heidelbeeren, Hafermilch, Cola..." />
           </div>
 
           <div class="form-group amount-unit-row">
             <div>
               <label for="amount-input">Menge</label>
-              <input type="number" id="amount-input" step="any" min="0.1" value="${this._amount || 1}" />
+              <input type="number" id="amount-input" step="any" min="0.1" value="1" />
             </div>
             <div>
               <label for="unit-select">Einheit</label>
               <select id="unit-select">
-                <option value="x" ${this._unit === "x" ? "selected" : ""}>x (Stück / Packung)</option>
-                <option value="g" ${this._unit === "g" ? "selected" : ""}>g (Gramm)</option>
-                <option value="kg" ${this._unit === "kg" ? "selected" : ""}>kg (Kilogramm)</option>
-                <option value="ml" ${this._unit === "ml" ? "selected" : ""}>ml (Milliliter)</option>
-                <option value="L" ${this._unit === "L" ? "selected" : ""}>L (Liter)</option>
-                <option value="Kiste" ${this._unit === "Kiste" ? "selected" : ""}>Kiste(n)</option>
+                <option value="x" selected>x (Stück / Packung)</option>
+                <option value="g">g (Gramm)</option>
+                <option value="kg">kg (Kilogramm)</option>
+                <option value="ml">ml (Milliliter)</option>
+                <option value="L">L (Liter)</option>
+                <option value="Kiste">Kiste(n)</option>
               </select>
             </div>
           </div>
@@ -1166,48 +1590,31 @@ class FlaschenpostView extends HTMLElement {
           <div class="form-group">
             <label for="sort-select">Sortierkriterium</label>
             <select id="sort-select">
-              <option value="price" ${this._sort === "price" ? "selected" : ""}>Günstigster Gesamtpreis (Standard)</option>
-              <option value="price_per_kg" ${this._sort === "price_per_kg" ? "selected" : ""}>Günstigster Grundpreis (€/kg)</option>
-              <option value="price_per_liter" ${this._sort === "price_per_liter" ? "selected" : ""}>Günstigster Grundpreis (€/L)</option>
-              <option value="price_per_unit" ${this._sort === "price_per_unit" ? "selected" : ""}>Günstigster Stückpreis (€/Einheit)</option>
-              <option value="relevance" ${this._sort === "relevance" ? "selected" : ""}>Relevanz (Flaschenpost)</option>
+              <option value="price" selected>Günstigster Gesamtpreis (Standard)</option>
+              <option value="price_per_kg">Günstigster Grundpreis (€/kg)</option>
+              <option value="price_per_liter">Günstigster Grundpreis (€/L)</option>
+              <option value="price_per_unit">Günstigster Stückpreis (€/Einheit)</option>
+              <option value="relevance">Relevanz (Flaschenpost)</option>
             </select>
           </div>
 
-          ${
-            this._categories && this._categories.length > 0
-              ? `
-            <div class="form-group">
-              <label for="category-select">Kategorie-Filter (Optional)</label>
-              <select id="category-select">
-                <option value="">Alle Kategorien</option>
-                ${this._categories
-                  .map(
-                    (cat) => `
-                  <option value="${cat.value}" ${this._category === cat.value ? "selected" : ""}>${cat.label}</option>
-                `
-                  )
-                  .join("")}
-              </select>
-            </div>
-          `
-              : ""
-          }
+          <div class="form-group" id="category-group">
+            <label for="category-select">Kategorie-Filter (Optional)</label>
+            <select id="category-select">
+              <option value="">Alle Kategorien</option>
+            </select>
+          </div>
 
           <!-- Negative Keywords Builder Section -->
           <div class="form-group" style="margin-top: 14px;">
             <label style="color: #c62828;">🚫 Negative Keywords (Ausschließen mit !)</label>
-            <div id="chips-neg-container" class="chips-container">
-              ${this._renderNegativeChipsHtml()}
-            </div>
+            <div id="chips-neg-container" class="chips-container"></div>
           </div>
 
           <!-- Positive Keywords Builder Section -->
           <div class="form-group">
             <label style="color: #2e7d32;">✓ Positive Keywords (Qualifizierer)</label>
-            <div id="chips-pos-container" class="chips-container">
-              ${this._renderPositiveChipsHtml()}
-            </div>
+            <div id="chips-pos-container" class="chips-container"></div>
           </div>
 
           <!-- Custom Keyword Adder Input -->
@@ -1220,7 +1627,7 @@ class FlaschenpostView extends HTMLElement {
           <!-- Add to List Action -->
           <div style="margin-top: 18px;">
             <button class="btn-primary" style="width: 100%; justify-content: center; padding: 12px;" id="btn-save-builder">
-              ${this._editingUid ? "💾 Eintrag aktualisieren" : `➕ Zu '${this._activeList}' hinzufügen`}
+              ➕ Zu 'Einkaufsliste' hinzufügen
             </button>
           </div>
         </div>
@@ -1228,205 +1635,39 @@ class FlaschenpostView extends HTMLElement {
         <!-- Right Side: Items in Active List & Live Search Candidates -->
         <div style="display: flex; flex-direction: column; gap: 16px;">
           <!-- Live Preview Search Results Card -->
-          <div id="preview-container">
-            ${this._renderPreviewContent()}
-          </div>
+          <div id="preview-container"></div>
 
           <!-- Active Shopping List Items Card -->
-          <div class="panel-card">
+          <div class="panel-card" id="active-list-card">
             <div class="card-title">
-              <span>📋 ${this._activeList} (${openItems.length} offen, ${completedItems.length} erledigt)</span>
+              <span>📋 Einkaufsliste</span>
               <div style="display: flex; gap: 8px;">
                 <button class="btn-outline" id="btn-sync-active-list">In Warenkorb</button>
               </div>
             </div>
-
-            ${
-              listItems.length === 0
-                ? `<div style="padding: 24px; text-align: center; color: #888;">Diese Liste ist noch leer. Nutze die Suche links, um Artikel hinzuzufügen!</div>`
-                : `
-              <table class="list-items-table">
-                <tbody>
-                  ${openItems
-                    .map(
-                      (item) => `
-                    <tr>
-                      <td style="width: 32px;">
-                        <input type="checkbox" class="chk-item" data-uid="${item.uid}" />
-                      </td>
-                      <td>
-                        <div class="item-text">${item.summary}</div>
-                        ${item.last_resolved_note ? `<div class="item-note">💡 ${item.last_resolved_note}</div>` : ""}
-                      </td>
-                      <td style="text-align: right; white-space: nowrap;">
-                        <button class="btn-outline btn-edit-item" data-uid="${item.uid}" style="padding: 4px 8px; font-size: 0.8rem;">✏️</button>
-                        <button class="btn-outline btn-del-item" data-uid="${item.uid}" style="padding: 4px 8px; font-size: 0.8rem; color: #d32f2f;">✕</button>
-                      </td>
-                    </tr>
-                  `
-                    )
-                    .join("")}
-
-                  ${
-                    completedItems.length > 0
-                      ? `
-                    <tr>
-                      <td colspan="3" style="padding-top: 16px; font-size: 0.8rem; font-weight: 700; color: #888; text-transform: uppercase;">
-                        Erledigt (${completedItems.length})
-                      </td>
-                    </tr>
-                    ${completedItems
-                      .map(
-                        (item) => `
-                      <tr>
-                        <td style="width: 32px;">
-                          <input type="checkbox" checked class="chk-item" data-uid="${item.uid}" />
-                        </td>
-                        <td>
-                          <div class="item-text completed">${item.summary}</div>
-                        </td>
-                        <td style="text-align: right; white-space: nowrap;">
-                          <button class="btn-outline btn-del-item" data-uid="${item.uid}" style="padding: 4px 8px; font-size: 0.8rem; color: #d32f2f;">✕</button>
-                        </td>
-                      </tr>
-                    `
-                      )
-                      .join("")}
-                  `
-                      : ""
-                  }
-                </tbody>
-              </table>
-            `
-            }
+            <div id="list-items-container"></div>
           </div>
         </div>
       </div>
 
-      <!-- Dry Run Preview Modal -->
-      ${
-        this._showDryRunModal && this._dryRunResult
-          ? `
-        <div class="modal-overlay" id="modal-overlay-dryrun">
-          <div class="modal-box">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-              <h2 style="margin: 0; font-size: 1.25rem;">Live Resolution Vorschau (${this._dryRunResult.lists_merged ? this._dryRunResult.lists_merged.join(", ") : ""})</h2>
-              <button class="btn-outline" id="btn-close-dryrun">✕</button>
-            </div>
-
-            <div style="margin-bottom: 16px; font-size: 1.05rem;">
-              Geschätzter Warenwert: <strong>${(this._dryRunResult.estimated_goods_eur || 0).toFixed(2)} €</strong>
-            </div>
-
-            <div style="overflow-x: auto; max-height: 45vh;">
-              <table class="candidate-table">
-                <thead>
-                  <tr>
-                    <th>Anfrage</th>
-                    <th>Gewähltes Produkt</th>
-                    <th>Menge</th>
-                    <th>Grundpreis</th>
-                    <th>Gesamt</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${(this._dryRunResult.resolved_items || [])
-                    .map(
-                      (r) => `
-                    <tr>
-                      <td><code>${r.requested}</code></td>
-                      <td><strong>${r.name}</strong><br /><span style="font-size:0.75rem; color:#888;">#${r.article_id}</span></td>
-                      <td>${r.quantity_added}x (${r.delivered_amount})</td>
-                      <td>${r.price_per_kg_eur ? `${Number(r.price_per_kg_eur).toFixed(2)} €/kg` : `${Number(r.unit_price_eur || 0).toFixed(2)} €`}</td>
-                      <td><strong>${Number(r.line_total_eur || 0).toFixed(2)} €</strong></td>
-                    </tr>
-                  `
-                    )
-                    .join("")}
-                </tbody>
-              </table>
-            </div>
-
-            ${
-              this._dryRunResult.unresolved && this._dryRunResult.unresolved.length > 0
-                ? `
-              <div style="margin-top: 14px; padding: 10px 14px; background: #ffebee; border-radius: 8px; color: #c62828; font-size: 0.85rem;">
-                <strong>Nicht auflösbar / Ausverkauft:</strong> ${this._dryRunResult.unresolved.join(", ")}
-              </div>
-            `
-                : ""
-            }
-
-            <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;">
-              <button class="btn-secondary" id="btn-sync-replace">Warenkorb leeren & neu füllen</button>
-              <button class="btn-primary" id="btn-sync-append">Zu aktuellem Warenkorb hinzufügen</button>
-            </div>
-          </div>
-        </div>
-      `
-          : ""
-      }
-
-      <!-- Buy Cart Confirmation Modal -->
-      ${
-        this._showBuyModal
-          ? `
-        <div class="modal-overlay" id="modal-overlay-buy">
-          <div class="modal-box">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-              <h2 style="margin: 0; font-size: 1.25rem; color: #2e7d32;">⚡ Flaschenpost Bestellung aufgeben</h2>
-              <button class="btn-outline" id="btn-close-buy">✕</button>
-            </div>
-
-            <div style="background: var(--secondary-background-color, #f9f9f9); padding: 16px; border-radius: 8px; margin-bottom: 16px;">
-              <div style="font-size: 1.1rem; font-weight: 700; margin-bottom: 8px;">
-                Warenkorb Gesamtsumme: ${(cartTotal || 0).toFixed(2)} €
-              </div>
-              <div style="font-size: 0.9rem; color: #666;">
-                Enthaltene Artikel: ${this._cart && this._cart.items ? this._cart.items.length : 0}
-              </div>
-            </div>
-
-            <div style="margin: 16px 0;">
-              <label style="display: flex; align-items: center; gap: 8px; font-size: 0.95rem; cursor: pointer;">
-                <input type="checkbox" id="chk-buy-confirm" ${this._buyConfirmChecked ? "checked" : ""} />
-                <strong>Ich bestätige die kostenpflichtige Bestellung bei Flaschenpost.</strong>
-              </label>
-            </div>
-
-            <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;">
-              <button class="btn-secondary" id="btn-cancel-buy">Abbrechen</button>
-              <button class="btn-success" id="btn-submit-buy" ${!this._buyConfirmChecked || this._buyLoading ? "disabled" : ""}>
-                ${this._buyLoading ? "Bestellung wird gesendet..." : "Jetzt kostenpflichtig bestellen"}
-              </button>
-            </div>
-          </div>
-        </div>
-      `
-          : ""
-      }
+      <!-- Modals Container -->
+      <div id="modals-container"></div>
     `;
 
-    this._bindEvents();
-
-    // Restore focus and cursor selection if an input had focus
-    if (activeId) {
-      const restoredEl = this.shadowRoot.getElementById(activeId);
-      if (restoredEl) {
-        restoredEl.focus();
-        if (selStart !== null && selEnd !== null && restoredEl.setSelectionRange) {
-          try {
-            restoredEl.setSelectionRange(selStart, selEnd);
-          } catch (_) {}
-        }
-      }
-    }
+    this._bindBuilderEvents();
+    this._updateCartUi();
+    this._updateTabsUi();
+    this._updateListItemsUi();
+    this._updateCategoryOptionsUi();
+    this._updateBuilderUi();
+    this._updatePreview();
+    this._updateModalsUi();
   }
 
-  _bindEvents() {
+  _bindBuilderEvents() {
     const root = this.shadowRoot;
+    if (!root) return;
 
-    // Search input
     const searchInput = root.getElementById("search-input");
     if (searchInput) {
       searchInput.addEventListener("input", (e) => {
@@ -1441,7 +1682,6 @@ class FlaschenpostView extends HTMLElement {
       });
     }
 
-    // Amount input
     const amountInput = root.getElementById("amount-input");
     if (amountInput) {
       amountInput.addEventListener("input", (e) => {
@@ -1450,7 +1690,6 @@ class FlaschenpostView extends HTMLElement {
       });
     }
 
-    // Unit select
     const unitSelect = root.getElementById("unit-select");
     if (unitSelect) {
       unitSelect.addEventListener("change", (e) => {
@@ -1459,7 +1698,6 @@ class FlaschenpostView extends HTMLElement {
       });
     }
 
-    // Sort select
     const sortSelect = root.getElementById("sort-select");
     if (sortSelect) {
       sortSelect.addEventListener("change", (e) => {
@@ -1468,7 +1706,6 @@ class FlaschenpostView extends HTMLElement {
       });
     }
 
-    // Category select
     const catSelect = root.getElementById("category-select");
     if (catSelect) {
       catSelect.addEventListener("change", (e) => {
@@ -1477,10 +1714,6 @@ class FlaschenpostView extends HTMLElement {
       });
     }
 
-    // Bind chips events
-    this._bindChipsEvents();
-
-    // Custom keyword adder
     const customKwInput = root.getElementById("custom-kw-input");
     const btnAddPos = root.getElementById("btn-add-pos-kw");
     const btnAddNeg = root.getElementById("btn-add-neg-kw");
@@ -1507,141 +1740,35 @@ class FlaschenpostView extends HTMLElement {
       });
     }
 
-    // Save from builder
     const btnSaveBuilder = root.getElementById("btn-save-builder");
     if (btnSaveBuilder) {
       btnSaveBuilder.addEventListener("click", () => this._handleSaveFromBuilder());
     }
 
-    // Cancel edit
     const btnCancelEdit = root.getElementById("btn-cancel-edit");
     if (btnCancelEdit) {
       btnCancelEdit.addEventListener("click", () => {
         this._clearBuilder();
-        this.render();
+        this._updateBuilderUi();
+        this._updatePreview();
       });
-    }
-
-    // Tabs
-    root.querySelectorAll(".tab-btn[data-list-name]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        this._activeList = btn.dataset.listName;
-        this.render();
-      });
-    });
-
-    // Add list
-    const btnAddList = root.getElementById("btn-add-list");
-    if (btnAddList) {
-      btnAddList.addEventListener("click", () => this._createNewList());
-    }
-
-    // Delete list
-    const btnDelList = root.getElementById("btn-delete-list");
-    if (btnDelList) {
-      btnDelList.addEventListener("click", () => this._deleteCurrentList());
-    }
-
-    // Checkbox toggle item
-    root.querySelectorAll(".chk-item[data-uid]").forEach((chk) => {
-      chk.addEventListener("change", () => {
-        const item = (this._lists[this._activeList] || []).find((it) => it.uid === chk.dataset.uid);
-        if (item) this._toggleItemCompleted(item);
-      });
-    });
-
-    // Edit item
-    root.querySelectorAll(".btn-edit-item[data-uid]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const item = (this._lists[this._activeList] || []).find((it) => it.uid === btn.dataset.uid);
-        if (item) this._loadItemIntoBuilder(item);
-      });
-    });
-
-    // Delete item
-    root.querySelectorAll(".btn-del-item[data-uid]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const item = (this._lists[this._activeList] || []).find((it) => it.uid === btn.dataset.uid);
-        if (item) this._deleteItem(item);
-      });
-    });
-
-    // Pin SKU buttons in candidate table
-    this._bindPreviewEvents();
-
-    // Top action buttons
-    const btnDryRun = root.getElementById("btn-dryrun-cart");
-    if (btnDryRun) {
-      btnDryRun.addEventListener("click", () => this._runDryRunPreview());
-    }
-
-    const btnSyncCart = root.getElementById("btn-sync-cart");
-    if (btnSyncCart) {
-      btnSyncCart.addEventListener("click", () => this._syncToCart(false));
     }
 
     const btnSyncActive = root.getElementById("btn-sync-active-list");
     if (btnSyncActive) {
       btnSyncActive.addEventListener("click", () => this._syncToCart(false));
     }
+  }
 
-    const btnBuyModal = root.getElementById("btn-buy-modal");
-    if (btnBuyModal) {
-      btnBuyModal.addEventListener("click", () => {
-        this._showBuyModal = true;
-        this.render();
-      });
-    }
-
-    // Modals
-    const btnCloseDryRun = root.getElementById("btn-close-dryrun");
-    if (btnCloseDryRun) {
-      btnCloseDryRun.addEventListener("click", () => {
-        this._showDryRunModal = false;
-        this.render();
-      });
-    }
-
-    const btnSyncReplace = root.getElementById("btn-sync-replace");
-    if (btnSyncReplace) {
-      btnSyncReplace.addEventListener("click", () => this._syncToCart(true));
-    }
-
-    const btnSyncAppend = root.getElementById("btn-sync-append");
-    if (btnSyncAppend) {
-      btnSyncAppend.addEventListener("click", () => this._syncToCart(false));
-    }
-
-    const btnCloseBuy = root.getElementById("btn-close-buy");
-    const btnCancelBuy = root.getElementById("btn-cancel-buy");
-    if (btnCloseBuy) {
-      btnCloseBuy.addEventListener("click", () => {
-        this._showBuyModal = false;
-        this.render();
-      });
-    }
-    if (btnCancelBuy) {
-      btnCancelBuy.addEventListener("click", () => {
-        this._showBuyModal = false;
-        this.render();
-      });
-    }
-
-    const chkBuyConfirm = root.getElementById("chk-buy-confirm");
-    if (chkBuyConfirm) {
-      chkBuyConfirm.addEventListener("change", (e) => {
-        this._buyConfirmChecked = e.target.checked;
-        const btnSubmit = root.getElementById("btn-submit-buy");
-        if (btnSubmit) {
-          btnSubmit.disabled = !this._buyConfirmChecked || this._buyLoading;
-        }
-      });
-    }
-
-    const btnSubmitBuy = root.getElementById("btn-submit-buy");
-    if (btnSubmitBuy) {
-      btnSubmitBuy.addEventListener("click", () => this._executeBuyCart());
-    }
+  render() {
+    this._ensureDom();
+    this._updateCartUi();
+    this._updateTabsUi();
+    this._updateListItemsUi();
+    this._updateCategoryOptionsUi();
+    this._updateBuilderUi();
+    this._updatePreview();
+    this._updateModalsUi();
   }
 
   _handleSaveFromBuilder() {

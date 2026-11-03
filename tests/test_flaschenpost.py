@@ -208,6 +208,8 @@ class _FakeApiClient:
                     [k.lower() for k in (kwargs.get("negative_keywords") or []) + extracted_neg]
                 )
             )
+            if category:
+                res = [c for c in res if matches_category_filter(c, category)]
             if eff_neg:
                 res = [c for c in res if not product_matches_negative_keywords(c, eff_neg)]
             return res[:limit]
@@ -290,7 +292,8 @@ class _FakeApiClient:
                 )
             )
             has_zucker_neg = any("zucker" in k for k in eff_neg)
-            if has_zucker_neg:
+            is_tk = bool(category and "tiefk" in category.lower())
+            if has_zucker_neg or is_tk:
                 return {
                     "article_id": 32672,
                     "quantity": 1,
@@ -795,7 +798,7 @@ class TestFlaschenpostHelpers(unittest.TestCase):
         self.assertIn("5.98 EUR/kg", plan["base_metric"])
         self.assertEqual(
             build_pinned_spec_summary(spec, product),
-            "500g Oryza Milch Reis #10495",
+            "500g Reis & Getreide::Oryza Milch Reis #10495",
         )
 
     def test_preview_search_and_list_preview(self) -> None:
@@ -1778,6 +1781,28 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             self.assertEqual(preview["candidates"][0]["line_total_eur"], 177.0)
             self.assertEqual(preview["candidates"][1]["article_id"], 1001)
             self.assertEqual(preview["candidates"][1]["line_total_eur"], 198.0)
+
+        asyncio.run(_run())
+
+    def test_preview_search_category_filter_reflected(self) -> None:
+        """Verify category filter is strictly enforced and reflected in preview candidates and pinned summary."""
+        async def _run() -> None:
+            fake_client = _FakeApiClient()
+            mgr = FlaschenpostShoppingListManager(client=fake_client)  # type: ignore[arg-type]
+
+            # Query without category: cand_29010 (Obst- & Gemüsekonserven) is cheaper and wins
+            preview_all = await mgr.async_preview_search("Heidelbeeren")
+            self.assertEqual(preview_all["winner"]["article_id"], 29010)
+            self.assertEqual(len(preview_all["candidates"]), 2)
+
+            # Query with category Tiefkühl: only cand_32672 (Tiefkühl) matches
+            preview_cat = await mgr.async_preview_search("Heidelbeeren", category="Tiefkühl")
+            self.assertEqual(preview_cat["winner"]["article_id"], 32672)
+            self.assertEqual(len(preview_cat["candidates"]), 1)
+            self.assertEqual(preview_cat["candidates"][0]["article_id"], 32672)
+            self.assertEqual(preview_cat["lazy_summary"], "Tiefkühl::Heidelbeeren")
+            self.assertIn("Category: *Tiefkühl > Obst*", preview_cat["markdown"])
+            self.assertIn("Tiefkühl::", preview_cat["candidates"][0]["pinned_summary"])
 
         asyncio.run(_run())
 

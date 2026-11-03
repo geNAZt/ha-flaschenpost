@@ -392,7 +392,7 @@ def build_pinned_spec_summary(
     pname = str(product.get("name") or spec.query).strip()
     pinned_spec = ParsedShoppingSpec(
         query=pname,
-        category=None,
+        category=spec.category,
         unit_type=spec.unit_type,
         target_amount_base=spec.target_amount_base,
         display_amount=spec.display_amount,
@@ -892,6 +892,13 @@ class FlaschenpostShoppingListManager:
                 only_crates=(spec.unit_type == UNIT_TYPE_CRATE),
                 negative_keywords=spec.negative_keywords,
             )
+
+        if spec.category and spec.category.strip():
+            from .api import matches_category_filter
+
+            candidates_raw = [
+                c for c in candidates_raw if matches_category_filter(c, spec.category)
+            ]
 
         enriched_candidates: list[dict[str, Any]] = []
         for cand in candidates_raw:
