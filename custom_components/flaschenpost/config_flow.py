@@ -326,12 +326,13 @@ class FlaschenpostConfigFlow(ConfigFlow, domain=DOMAIN):
                 self.context["preview_result"] = preview
                 return await self.async_step_preview_result()
 
+        prev_params = self.context.get("preview_query_params") or {}
         schema = vol.Schema(
             {
-                vol.Required("query"): str,
-                vol.Optional("amount_prefix", default=""): str,
-                vol.Optional("category", default=""): vol.In(cat_choices),
-                vol.Optional("sort_by", default=SORT_PRICE): vol.In(
+                vol.Required("query", default=prev_params.get("raw_query", "")): str,
+                vol.Optional("amount_prefix", default=prev_params.get("amount_prefix") or ""): str,
+                vol.Optional("category", default=prev_params.get("category") or ""): vol.In(cat_choices),
+                vol.Optional("sort_by", default=prev_params.get("sort_by") or SORT_PRICE): vol.In(
                     {opt["value"]: opt["label"] for opt in _SORT_SELECT_OPTIONS}
                 ),
             }
@@ -368,6 +369,7 @@ class FlaschenpostConfigFlow(ConfigFlow, domain=DOMAIN):
                 f"[{cand['packs']}x = {cand['line_total_eur']:.2f} €]"
             )
         add_options["refresh_sort"] = "↻ Update preview with selected sort order"
+        add_options["back_edit"] = "← Back (edit search query & filters)"
         add_options["skip"] = "Do not add (back to menu)"
 
         existing_lists = list(self._temp_mgr.list_names)
@@ -376,8 +378,11 @@ class FlaschenpostConfigFlow(ConfigFlow, domain=DOMAIN):
         sort_choices = {opt["value"]: opt["label"] for opt in _SORT_SELECT_OPTIONS}
 
         if user_input is not None:
-            new_sort = user_input.get("sort_by") or SORT_PRICE
             choice = user_input.get("chosen_option")
+            if choice == "back_edit":
+                return await self.async_step_preview_search()
+
+            new_sort = user_input.get("sort_by") or SORT_PRICE
 
             if choice == "refresh_sort" or new_sort != current_sort:
                 raw_q = params.get("raw_query") or (spec.query if spec else "")
@@ -702,12 +707,13 @@ class FlaschenpostOptionsFlow(OptionsFlow):
                 self.context["options_preview_result"] = preview
                 return await self.async_step_preview_result()
 
+        prev_params = self.context.get("options_preview_query_params") or {}
         schema = vol.Schema(
             {
-                vol.Required("query"): str,
-                vol.Optional("amount_prefix", default=""): str,
-                vol.Optional("category", default=""): vol.In(cat_choices),
-                vol.Optional("sort_by", default=SORT_PRICE): vol.In(
+                vol.Required("query", default=prev_params.get("raw_query", "")): str,
+                vol.Optional("amount_prefix", default=prev_params.get("amount_prefix") or ""): str,
+                vol.Optional("category", default=prev_params.get("category") or ""): vol.In(cat_choices),
+                vol.Optional("sort_by", default=prev_params.get("sort_by") or SORT_PRICE): vol.In(
                     {opt["value"]: opt["label"] for opt in _SORT_SELECT_OPTIONS}
                 ),
             }
@@ -745,6 +751,7 @@ class FlaschenpostOptionsFlow(OptionsFlow):
                 f"[{cand['packs']}x = {cand['line_total_eur']:.2f} €]"
             )
         add_options["refresh_sort"] = "↻ Update preview with selected sort order"
+        add_options["back_edit"] = "← Back (edit search query & filters)"
         add_options["skip"] = "Do not add (back to menu)"
 
         existing_lists = list(coord.shopping_list.list_names)
@@ -753,8 +760,11 @@ class FlaschenpostOptionsFlow(OptionsFlow):
         sort_choices = {opt["value"]: opt["label"] for opt in _SORT_SELECT_OPTIONS}
 
         if user_input is not None:
-            new_sort = user_input.get("sort_by") or SORT_PRICE
             choice = user_input.get("chosen_option")
+            if choice == "back_edit":
+                return await self.async_step_preview_search()
+
+            new_sort = user_input.get("sort_by") or SORT_PRICE
 
             if choice == "refresh_sort" or new_sort != current_sort:
                 raw_q = params.get("raw_query") or (spec.query if spec else "")
