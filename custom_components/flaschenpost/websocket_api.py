@@ -64,7 +64,8 @@ async def ws_get_lists(
         coord = _resolve_coord(hass, msg.get("config_entry_id"))
         lists = coord.shopping_list.get_all_lists_dict()
         names = coord.shopping_list.list_names
-        connection.send_result(msg["id"], {"lists": lists, "names": names})
+        configs = coord.shopping_list.get_all_list_configs()
+        connection.send_result(msg["id"], {"lists": lists, "names": names, "configs": configs})
     except Exception as err:
         _LOGGER.exception("Error in flaschenpost/get_lists: %s", err)
         connection.send_error(msg["id"], "error", str(err))
@@ -503,6 +504,95 @@ async def ws_buy_cart(
         connection.send_error(msg["id"], "error", str(err))
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "flaschenpost/set_list_config",
+        vol.Required("name"): str,
+        vol.Optional("random_enabled"): bool,
+        vol.Optional("random_count"): int,
+        vol.Optional("config_entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_set_list_config(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Update per-list configuration (e.g. weighted randomizer settings)."""
+    try:
+        coord = _resolve_coord(hass, msg.get("config_entry_id"))
+        name = str(msg["name"]).strip()
+        cfg = await coord.shopping_list.async_set_list_config(
+            name,
+            random_enabled=msg.get("random_enabled"),
+            random_count=msg.get("random_count"),
+        )
+        coord.async_update_listeners()
+        connection.send_result(msg["id"], {"name": name, "config": cfg.to_dict()})
+    except Exception as err:
+        _LOGGER.exception("Error in flaschenpost/set_list_config: %s", err)
+        connection.send_error(msg["id"], "error", str(err))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "flaschenpost/reset_list_weights",
+        vol.Required("name"): str,
+        vol.Optional("config_entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_reset_list_weights(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Reset randomizer weights of all items in a shopping list back to 1.0."""
+    try:
+        coord = _resolve_coord(hass, msg.get("config_entry_id"))
+        name = str(msg["name"]).strip()
+        await coord.shopping_list.async_reset_list_weights(name)
+        coord.async_update_listeners()
+        connection.send_result(msg["id"], {"success": True, "name": name})
+    except Exception as err:
+        _LOGGER.exception("Error in flaschenpost/reset_list_weights: %s", err)
+        connection.send_error(msg["id"], "error", str(err))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "flaschenpost/import_cart_to_list",
+        vol.Required("name"): str,
+        vol.Optional("config_entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_import_cart_to_list(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Import current Flaschenpost cart items by SKU into a new shopping list."""
+    try:
+        coord = _resolve_coord(hass, msg.get("config_entry_id"))
+        name = str(msg["name"]).strip()
+        items = await coord.shopping_list.async_import_cart_to_new_list(name)
+        coord.async_update_listeners()
+        connection.send_result(
+            msg["id"],
+            {
+                "success": True,
+                "name": name,
+                "imported_count": len(items),
+                "items": [it.to_dict() for it in items],
+            },
+        )
+    except Exception as err:
+        _LOGGER.exception("Error in flaschenpost/import_cart_to_list: %s", err)
+        connection.send_error(msg["id"], "error", str(err))
+
+
 def async_register_websocket_commands(hass: HomeAssistant) -> None:
     """Register all Flaschenpost WebSocket commands."""
     commands = [
@@ -518,6 +608,9 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
         ws_get_cart,
         ws_sync_to_cart,
         ws_buy_cart,
+        ws_set_list_config,
+        ws_reset_list_weights,
+        ws_import_cart_to_list,
     ]
     for cmd in commands:
         websocket_api.async_register_command(hass, cmd)

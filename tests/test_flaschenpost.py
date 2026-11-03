@@ -94,6 +94,7 @@ from custom_components.flaschenpost.const import (
     UNIT_TYPE_WEIGHT_G,
 )
 from custom_components.flaschenpost.shopping_list import (
+    DEFAULT_ITEM_WEIGHT,
     FlaschenpostShoppingListManager,
     ShoppingListItem,
     build_pinned_spec_summary,
@@ -114,9 +115,12 @@ from custom_components.flaschenpost.websocket_api import (
     ws_get_cart,
     ws_get_categories,
     ws_get_lists,
+    ws_import_cart_to_list,
     ws_preview_lists,
     ws_preview_search,
+    ws_reset_list_weights,
     ws_save_list,
+    ws_set_list_config,
     ws_sync_to_cart,
     ws_update_item,
 )
@@ -283,6 +287,22 @@ class _FakeApiClient:
         **kwargs: Any,
     ) -> dict[str, Any] | None:
         self.resolve_calls.append((query, category, unit_type, target_amount_base))
+        if article_id is not None:
+            qty = max(1, round(target_amount_base))
+            return {
+                "article_id": int(article_id),
+                "quantity": qty,
+                "unit_type": unit_type,
+                "requested_amount_base": target_amount_base,
+                "delivered_amount_base": float(qty),
+                "line_total_eur": round(qty * 2.50, 2),
+                "product": {
+                    "article_id": int(article_id),
+                    "name": query,
+                    "description": "1x",
+                    "price_eur": 2.50,
+                },
+            }
         ql = query.lower()
         if "heidelbeeren" in ql:
             __clean_q, extracted_neg = extract_negative_keywords(query)
@@ -1560,7 +1580,7 @@ class TestFlaschenpostHelpers(unittest.TestCase):
 
             # Test command registration
             async_register_websocket_commands(mock_hass)  # type: ignore[arg-type]
-            self.assertEqual(len(registered_cmds), 12)
+            self.assertEqual(len(registered_cmds), 15)
 
             conn = _MockActiveConn()
 
@@ -1722,6 +1742,51 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             self.assertIn(13, conn.results)
             self.assertTrue(conn.results[13]["deleted"])
 
+            # 14. ws_import_cart_to_list
+            await ws_import_cart_to_list(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 14,
+                    "type": "flaschenpost/import_cart_to_list",
+                    "name": "Cart Import",
+                },
+            )
+            self.assertIn(14, conn.results)
+            self.assertTrue(conn.results[14]["success"])
+            self.assertEqual(conn.results[14]["name"], "Cart Import")
+            self.assertEqual(conn.results[14]["imported_count"], 1)
+            self.assertEqual(conn.results[14]["items"][0]["article_id"], 32672)
+
+            # 15. ws_set_list_config
+            await ws_set_list_config(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 15,
+                    "type": "flaschenpost/set_list_config",
+                    "name": "Cart Import",
+                    "random_enabled": True,
+                    "random_count": 2,
+                },
+            )
+            self.assertIn(15, conn.results)
+            self.assertTrue(conn.results[15]["config"]["random_enabled"])
+            self.assertEqual(conn.results[15]["config"]["random_count"], 2)
+
+            # 16. ws_reset_list_weights
+            await ws_reset_list_weights(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 16,
+                    "type": "flaschenpost/reset_list_weights",
+                    "name": "Cart Import",
+                },
+            )
+            self.assertIn(16, conn.results)
+            self.assertTrue(conn.results[16]["success"])
+
             # 14. Verify frontend panel JS asset exists and contains web component
             panel_js_file = _PKG_DIR / "frontend" / "flaschenpost-panel.js"
             self.assertTrue(panel_js_file.exists())
@@ -1861,6 +1926,85 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             self.assertIn("Tiefkühl::", preview_cat["candidates"][0]["pinned_summary"])
 
         asyncio.run(_run())
+
+    def test_cart_import_and_weighted_randomizer(self) -> None:
+        """Verify importing cart line items by SKU and weighted random picking per list."""
+        async def _run() -> None:
+            fake_client = _FakeApiClient()
+            mgr = FlaschenpostShoppingListManager(client=fake_client)  # type: ignore[arg-type]
+
+            # 1. Import cart with items into a new list
+            items = await mgr.async_import_cart_to_new_list("Warenkorb Import")
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].article_id, 32672)
+            self.assertIn("#32672", items[0].summary)
+            self.assertEqual(items[0].weight, DEFAULT_ITEM_WEIGHT)
+            self.assertIn("Warenkorb Import", mgr.list_names)
+
+            # 2. Reject empty cart
+            fake_client_empty = _FakeApiClient()
+            fake_client_empty.async_get_cart = lambda: asyncio.sleep(0, result={"lineItems": []})  # type: ignore[assignment]
+            mgr_empty = FlaschenpostShoppingListManager(client=fake_client_empty)  # type: ignore[arg-type]
+            with self.assertRaises(ValueError):
+                await mgr_empty.async_import_cart_to_new_list("Empty List")
+
+            # 3. Setup list for randomizer testing
+            # Add 4 items: A, B, C, D
+            await mgr.async_save_named_list(
+                "Snacks",
+                [
+                    "K-Classic Heidelbeeren #32672",
+                    "Alnatura Bio Wildheidelbeeren #18089",
+                    "Oryza Milch Reis #10495",
+                    "K-Classic Naturjoghurt 1,5% #28435",
+                ],
+                replace=True,
+            )
+            cfg = await mgr.async_set_list_config("Snacks", random_enabled=True, random_count=2)
+            self.assertTrue(cfg.random_enabled)
+            self.assertEqual(cfg.random_count, 2)
+
+            # Check all initial weights are 1.0
+            initial_items = mgr.get_list_items("Snacks")
+            self.assertEqual(len(initial_items), 4)
+            for it in initial_items:
+                self.assertEqual(it.weight, 1.0)
+
+            # 4. Dry-run preview should pick 2 items, but NOT mutate weights
+            preview = await mgr.async_preview_lists(["Snacks"])
+            self.assertEqual(len(preview["resolved_items"]), 2)
+            for it in mgr.get_list_items("Snacks"):
+                self.assertEqual(it.weight, 1.0)
+
+            # 5. Real cart add (dry_run=False) should mutate weights
+            res = await mgr.async_add_lists_to_cart(["Snacks"], dry_run=False)
+            self.assertEqual(len(res["resolved_items"]), 2)
+            picked_aids = {r["article_id"] for r in res["resolved_items"]}
+            self.assertEqual(len(picked_aids), 2)
+
+            after_run_1 = mgr.get_list_items("Snacks")
+            for it in after_run_1:
+                if it.article_id in picked_aids:
+                    self.assertEqual(it.weight, 1.0, f"Picked item {it.article_id} should reset to weight 1.0")
+                else:
+                    self.assertEqual(it.weight, 2.0, f"Unpicked item {it.article_id} should increase weight to 2.0")
+
+            # 6. Run successive syncs and verify all items eventually get picked due to increasing weights
+            all_picked_aids: set[int] = set(picked_aids)
+            for _ in range(15):
+                res_i = await mgr.async_add_lists_to_cart(["Snacks"], dry_run=False)
+                for r in res_i["resolved_items"]:
+                    all_picked_aids.add(r["article_id"])
+
+            self.assertEqual(all_picked_aids, {32672, 18089, 10495, 28435}, "All items must eventually be picked")
+
+            # 7. Test reset weights
+            await mgr.async_reset_list_weights("Snacks")
+            for it in mgr.get_list_items("Snacks"):
+                self.assertEqual(it.weight, 1.0)
+
+        asyncio.run(_run())
+
 
 if __name__ == "__main__":
     unittest.main()

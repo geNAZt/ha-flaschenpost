@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import random
 import re
 import uuid
 from collections.abc import Callable, Mapping
@@ -15,6 +16,7 @@ from .api import (
     extract_negative_keywords,
 )
 from .const import (
+    DEFAULT_ITEM_WEIGHT,
     DEFAULT_SHOPPING_LIST_NAME,
     ORIGIN_FAVORITES,
     ORIGIN_SEARCH,
@@ -487,6 +489,29 @@ def format_shopping_item_summary(
     return f"{prefix}{name}{suffix}"
 
 
+
+@dataclass
+class ShoppingListConfig:
+    """Per-list configuration options, such as weighted randomizer settings."""
+
+    random_enabled: bool = False
+    random_count: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "random_enabled": self.random_enabled,
+            "random_count": self.random_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> ShoppingListConfig:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            random_enabled=bool(data.get("random_enabled", False)),
+            random_count=max(1, int(data.get("random_count", 1))),
+        )
+
 @dataclass
 class ShoppingListItem:
     """Persistent Flaschenpost shopping list item (resolved lazily at cart-add time)."""
@@ -503,6 +528,7 @@ class ShoppingListItem:
     negative_keywords: list[str] = field(default_factory=list)
     last_resolved_note: str | None = None
     completed: bool = False
+    weight: float = DEFAULT_ITEM_WEIGHT
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict."""
@@ -528,6 +554,14 @@ class ShoppingListItem:
             negs = list(spec.negative_keywords)
 
         explicit_aid = spec.explicit_article_id
+        raw_w = data.get("weight")
+        try:
+            item_weight = float(raw_w) if raw_w is not None else DEFAULT_ITEM_WEIGHT
+            if item_weight <= 0:
+                item_weight = DEFAULT_ITEM_WEIGHT
+        except (ValueError, TypeError):
+            item_weight = DEFAULT_ITEM_WEIGHT
+
         return cls(
             uid=str(data.get("uid") or uuid.uuid4()),
             summary=summary,
@@ -541,6 +575,7 @@ class ShoppingListItem:
             negative_keywords=negs,
             last_resolved_note=data.get("last_resolved_note"),
             completed=bool(data.get("completed", False)),
+            weight=item_weight,
         )
 
 
@@ -569,6 +604,7 @@ class FlaschenpostShoppingListManager:
         self._lists: dict[str, list[ShoppingListItem]] = {
             DEFAULT_SHOPPING_LIST_NAME: []
         }
+        self._list_configs: dict[str, ShoppingListConfig] = {}
         self._list_added_callbacks: list[Callable[[str], None]] = []
         self._list_deleted_callbacks: list[Callable[[str], None]] = []
 
@@ -660,6 +696,11 @@ class FlaschenpostShoppingListManager:
             if DEFAULT_SHOPPING_LIST_NAME not in loaded:
                 loaded = {DEFAULT_SHOPPING_LIST_NAME: [], **loaded}
             self._lists = loaded
+            if isinstance(raw.get("list_configs"), dict):
+                self._list_configs = {
+                    str(k): ShoppingListConfig.from_dict(v)
+                    for k, v in raw["list_configs"].items()
+                }
         elif isinstance(raw.get("items"), list):
             self._lists = {
                 DEFAULT_SHOPPING_LIST_NAME: [
@@ -667,11 +708,54 @@ class FlaschenpostShoppingListManager:
                 ]
             }
 
+    def get_list_config(self, list_name: str) -> ShoppingListConfig:
+        """Return configuration for a named shopping list."""
+        key = self._resolve_existing_list_key(list_name) or list_name.strip()
+        if key not in self._list_configs:
+            self._list_configs[key] = ShoppingListConfig()
+        return self._list_configs[key]
+
+    async def async_set_list_config(
+        self,
+        list_name: str,
+        *,
+        random_enabled: bool | None = None,
+        random_count: int | None = None,
+    ) -> ShoppingListConfig:
+        """Update and persist configuration for a named shopping list."""
+        key = self._ensure_list(list_name)
+        cfg = self.get_list_config(key)
+        if random_enabled is not None:
+            cfg.random_enabled = bool(random_enabled)
+        if random_count is not None:
+            cfg.random_count = max(1, int(random_count))
+        await self.async_save()
+        return cfg
+
+    def get_all_list_configs(self) -> dict[str, dict[str, Any]]:
+        """Return serialized configuration dictionary for all managed lists."""
+        return {
+            name: self.get_list_config(name).to_dict()
+            for name in self._lists
+        }
+
+    async def async_reset_list_weights(self, list_name: str) -> None:
+        """Reset weights of all items in a named list to default weight."""
+        key = self._resolve_existing_list_key(list_name)
+        if key is None:
+            return
+        for it in self._lists[key]:
+            it.weight = DEFAULT_ITEM_WEIGHT
+        await self.async_save()
+
     async def async_save(self) -> None:
-        """Persist all named lists to Home Assistant Store."""
+        """Persist all named lists and list configurations to Home Assistant Store."""
         if self._store is None:
             return
-        await self._store.async_save({"lists": self.get_all_lists_dict()})
+        await self._store.async_save({
+            "lists": self.get_all_lists_dict(),
+            "list_configs": self.get_all_list_configs(),
+        })
 
     def _build_lazy_item(
         self,
@@ -712,6 +796,7 @@ class FlaschenpostShoppingListManager:
             sort_by=effective_sort,
             negative_keywords=spec.negative_keywords,
             completed=False,
+            weight=DEFAULT_ITEM_WEIGHT,
         )
 
     async def async_save_named_list(
@@ -745,6 +830,7 @@ class FlaschenpostShoppingListManager:
             self._lists[key] = []
         else:
             self._lists.pop(key, None)
+            self._list_configs.pop(key, None)
             for cb in self._list_deleted_callbacks:
                 cb(key)
         await self.async_save()
@@ -841,6 +927,144 @@ class FlaschenpostShoppingListManager:
                     seen_values.add(val)
                     options.append({"value": val, "label": f"{tname} -> {sname}"})
         return options
+
+
+    @staticmethod
+    def _pick_weighted_random_items(
+        items: list[ShoppingListItem],
+        count: int,
+    ) -> tuple[list[ShoppingListItem], list[ShoppingListItem]]:
+        """Select count items from pool without replacement using weighted random selection.
+
+        Returns (picked, unpicked).
+        """
+        if len(items) <= count:
+            return list(items), []
+
+        pool = list(items)
+        picked: list[ShoppingListItem] = []
+        target_count = min(count, len(items))
+        for _ in range(target_count):
+            weights = [
+                max(0.001, float(getattr(it, "weight", DEFAULT_ITEM_WEIGHT) or DEFAULT_ITEM_WEIGHT))
+                for it in pool
+            ]
+            chosen = random.choices(pool, weights=weights, k=1)[0]
+            picked.append(chosen)
+            pool.remove(chosen)
+        return picked, pool
+
+    def _apply_random_pick(
+        self,
+        candidates: list[ShoppingListItem],
+        count: int,
+        *,
+        dry_run: bool = False,
+    ) -> list[ShoppingListItem]:
+        """Pick items with weighted randomizer and update weights if not dry_run."""
+        picked, unpicked = self._pick_weighted_random_items(candidates, count)
+        if not dry_run:
+            for it in picked:
+                it.weight = DEFAULT_ITEM_WEIGHT
+            for it in unpicked:
+                curr = float(getattr(it, "weight", DEFAULT_ITEM_WEIGHT) or DEFAULT_ITEM_WEIGHT)
+                it.weight = round(curr + 1.0, 2)
+        return picked
+
+    async def async_import_cart_to_new_list(
+        self,
+        list_name: str,
+    ) -> list[ShoppingListItem]:
+        """Import all current cart line items by SKU into a new or replaced shopping list."""
+        clean_name = list_name.strip()
+        if not clean_name:
+            raise ValueError("Name der Einkaufsliste darf nicht leer sein.")
+
+        cart = await self._client.async_get_cart()
+        line_items = cart.get("lineItems") or []
+        if not line_items:
+            raise ValueError("Der Flaschenpost-Warenkorb ist leer.")
+
+        raw_entries: list[tuple[int, int, str]] = []
+        missing_name_aids: list[int] = []
+
+        for li in line_items:
+            qty = max(1, int(li.get("quantity") or 1))
+            var = li.get("variant") or {}
+            sku = (
+                var.get("sku")
+                or var.get("key")
+                or li.get("articleId")
+                or li.get("article_id")
+            )
+            aid: int | None = None
+            if sku is not None:
+                try:
+                    aid = int(sku)
+                except (ValueError, TypeError):
+                    aid = None
+
+            name_val = li.get("name")
+            if not name_val and isinstance(li.get("product"), dict):
+                name_val = li["product"].get("name")
+
+            name_str = ""
+            if isinstance(name_val, dict):
+                name_str = str(
+                    name_val.get("de-DE")
+                    or name_val.get("de")
+                    or next(iter(name_val.values()), "")
+                ).strip()
+            elif isinstance(name_val, str):
+                name_str = name_val.strip()
+
+            if aid is not None:
+                if not name_str:
+                    missing_name_aids.append(aid)
+                raw_entries.append((aid, qty, name_str))
+
+        if not raw_entries:
+            raise ValueError("Keine Artikel mit gültiger SKU im Warenkorb gefunden.")
+
+        if missing_name_aids and hasattr(
+            self._client, "async_get_products_by_article_ids"
+        ):
+            try:
+                hydrated = await self._client.async_get_products_by_article_ids(
+                    missing_name_aids
+                )
+                aid_to_name = {
+                    p["article_id"]: p.get("name")
+                    for p in hydrated
+                    if p.get("article_id")
+                }
+                raw_entries = [
+                    (aid, qty, name or aid_to_name.get(aid) or f"Artikel #{aid}")
+                    for aid, qty, name in raw_entries
+                ]
+            except Exception:
+                pass
+
+        merged_entries: dict[int, tuple[int, str]] = {}
+        for aid, qty, name in raw_entries:
+            if aid in merged_entries:
+                prev_qty, prev_name = merged_entries[aid]
+                merged_entries[aid] = (prev_qty + qty, prev_name or name)
+            else:
+                merged_entries[aid] = (qty, name)
+
+        formatted_lines = [
+            f"{qty}x {name or f'Artikel #{aid}'} #{aid}"
+            if qty > 1
+            else f"{name or f'Artikel #{aid}'} #{aid}"
+            for aid, (qty, name) in merged_entries.items()
+        ]
+
+        key = self._ensure_list(clean_name)
+        built = [self._build_lazy_item(line) for line in formatted_lines]
+        self._lists[key] = built
+        await self.async_save()
+        return list(self._lists[key])
 
     async def async_preview_search(
         self,
@@ -1085,13 +1309,24 @@ class FlaschenpostShoppingListManager:
 
         norm_default_sort = resolve_sort_alias(default_sort_by) or default_sort_by
 
+        random_mutated: bool = False
         for requested_name in target_names:
             internal_key = self._resolve_existing_list_key(requested_name)
             if internal_key is not None:
                 matched_lists.append(internal_key)
-                for item in self._lists[internal_key]:
-                    if item.completed:
-                        continue
+                cfg = self.get_list_config(internal_key)
+                uncompleted = [item for item in self._lists[internal_key] if not item.completed]
+
+                if cfg.random_enabled and uncompleted:
+                    items_to_process = self._apply_random_pick(
+                        uncompleted, cfg.random_count, dry_run=dry_run
+                    )
+                    if not dry_run:
+                        random_mutated = True
+                else:
+                    items_to_process = uncompleted
+
+                for item in items_to_process:
                     eff_sort = item.sort_by or norm_default_sort
                     mkey = (
                         item.query.strip().lower(),
@@ -1264,7 +1499,10 @@ class FlaschenpostShoppingListManager:
                 for item in completed_candidates:
                     item.completed = True
             await self.async_save()
-        elif dry_run and completed_candidates:
+        elif not dry_run and (completed_candidates or random_mutated):
+            if mark_completed and completed_candidates:
+                for item in completed_candidates:
+                    item.completed = True
             await self.async_save()
 
         return {

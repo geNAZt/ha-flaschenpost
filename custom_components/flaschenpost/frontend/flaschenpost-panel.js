@@ -1,7 +1,7 @@
 /**
  * Flaschenpost Interactive Shopping List Panel & Lovelace Card
  * Custom Web Component for Home Assistant
- * Version: 2.0.3
+ * Version: 2.0.4
  */
 
 class FlaschenpostView extends HTMLElement {
@@ -13,6 +13,7 @@ class FlaschenpostView extends HTMLElement {
     this._config = {};
     this._activeList = "Einkaufsliste";
     this._lists = { Einkaufsliste: [] };
+    this._listConfigs = {};
     this._listNames = ["Einkaufsliste"];
     this._categories = [];
     this._cart = null;
@@ -80,6 +81,9 @@ class FlaschenpostView extends HTMLElement {
       if (resp && resp.lists) {
         this._lists = resp.lists;
         this._listNames = resp.names && resp.names.length > 0 ? resp.names : Object.keys(resp.lists);
+        if (resp.configs) {
+          this._listConfigs = resp.configs;
+        }
         if (!this._listNames.includes(this._activeList)) {
           this._activeList = this._listNames[0] || "Einkaufsliste";
         }
@@ -337,6 +341,60 @@ class FlaschenpostView extends HTMLElement {
     const searchInput = this.shadowRoot.getElementById("search-input");
     if (searchInput) {
       searchInput.focus();
+    }
+  }
+
+  async _importCartToNewList() {
+    const defaultName = `Warenkorb ${new Date().toLocaleDateString("de-DE")}`;
+    const name = window.prompt("Name der neuen Einkaufsliste für den Warenkorb-Import:", defaultName);
+    if (!name || !name.trim()) return;
+    const clean = name.trim();
+    try {
+      this._showToast("Importiere aktuellen Warenkorb...");
+      const resp = await this._hass.callWS({
+        type: "flaschenpost/import_cart_to_list",
+        name: clean,
+      });
+      this._activeList = clean;
+      await this._fetchLists();
+      this._updateTabsUi();
+      this._updateListItemsUi();
+      this._updateBuilderUi();
+      this._showToast(`Liste '${clean}' mit ${resp.imported_count || 0} Artikeln importiert!`);
+    } catch (err) {
+      this._showToast(`Import fehlgeschlagen: ${err.message || err}`, true);
+    }
+  }
+
+  async _saveListConfig(listName, { random_enabled, random_count }) {
+    try {
+      const resp = await this._hass.callWS({
+        type: "flaschenpost/set_list_config",
+        name: listName,
+        random_enabled,
+        random_count,
+      });
+      if (!this._listConfigs) this._listConfigs = {};
+      this._listConfigs[listName] = resp.config || { random_enabled, random_count };
+      this._updateTabsUi();
+      this._updateListItemsUi();
+      this._showToast(`Zufallsauswahl für '${listName}' gespeichert!`);
+    } catch (err) {
+      this._showToast(`Fehler: ${err.message || err}`, true);
+    }
+  }
+
+  async _resetListWeights(listName) {
+    try {
+      await this._hass.callWS({
+        type: "flaschenpost/reset_list_weights",
+        name: listName,
+      });
+      await this._fetchLists();
+      this._updateListItemsUi();
+      this._showToast("Gewichte auf 1.0 zurückgesetzt!");
+    } catch (err) {
+      this._showToast(`Fehler: ${err.message || err}`, true);
     }
   }
 
@@ -744,13 +802,17 @@ class FlaschenpostView extends HTMLElement {
           const count = (this._lists[lname] || []).filter((i) => !i.completed).length;
           const activeCls = lname === this._activeList ? "active" : "";
           return `
+            const lcfg = (this._listConfigs && this._listConfigs[lname]) || {};
+            const rndBadge = lcfg.random_enabled ? ` 🎲${lcfg.random_count || 1}` : "";
+            return `
             <button class="tab-btn ${activeCls}" data-list-name="${lname}">
-              ${lname} (${count})
+              ${lname} (${count}${rndBadge})
             </button>
           `;
         })
         .join("")}
       <button class="btn-outline" id="btn-add-list">+ Neue Liste</button>
+      <button class="btn-outline" id="btn-import-cart" title="Warenkorb in eine neue Einkaufsliste importieren">📥 Warenkorb importieren</button>
       ${
         this._listNames.length > 1
           ? `<button class="btn-outline btn-danger" id="btn-delete-list" title="Aktive Liste löschen">🗑</button>`
@@ -772,9 +834,40 @@ class FlaschenpostView extends HTMLElement {
       btnAddList.addEventListener("click", () => this._createNewList());
     }
 
+    const btnImportCart = tabsContainer.querySelector("#btn-import-cart");
+    if (btnImportCart) {
+      btnImportCart.addEventListener("click", () => this._importCartToNewList());
+    }
+
     const btnDelList = tabsContainer.querySelector("#btn-delete-list");
     if (btnDelList) {
       btnDelList.addEventListener("click", () => this._deleteCurrentList());
+    }
+  }
+
+  _bindConfigBarEvents(container, cfg) {
+    const chkRandom = container.querySelector("#chk-random-enabled");
+    if (chkRandom) {
+      chkRandom.addEventListener("change", async (e) => {
+        const enabled = e.target.checked;
+        const count = cfg.random_count || 1;
+        await this._saveListConfig(this._activeList, { random_enabled: enabled, random_count: count });
+      });
+    }
+
+    const inputRandomCount = container.querySelector("#input-random-count");
+    if (inputRandomCount) {
+      inputRandomCount.addEventListener("change", async (e) => {
+        const count = Math.max(1, parseInt(e.target.value, 10) || 1);
+        await this._saveListConfig(this._activeList, { random_enabled: true, random_count: count });
+      });
+    }
+
+    const btnResetWeights = container.querySelector("#btn-reset-weights");
+    if (btnResetWeights) {
+      btnResetWeights.addEventListener("click", async () => {
+        await this._resetListWeights(this._activeList);
+      });
     }
   }
 
@@ -789,16 +882,45 @@ class FlaschenpostView extends HTMLElement {
     const openItems = listItems.filter((it) => !it.completed);
     const completedItems = listItems.filter((it) => it.completed);
 
+    const cfg = (this._listConfigs && this._listConfigs[this._activeList]) || { random_enabled: false, random_count: 1 };
+
     if (cardTitleSpan) {
-      cardTitleSpan.textContent = `📋 ${this._activeList} (${openItems.length} offen, ${completedItems.length} erledigt)`;
+      const rndInfo = cfg.random_enabled ? ` • 🎲 ${cfg.random_count || 1} zufällig` : "";
+      cardTitleSpan.textContent = `📋 ${this._activeList} (${openItems.length} offen, ${completedItems.length} erledigt${rndInfo})`;
     }
 
+    const configBarHtml = `
+      <div class="list-config-bar">
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <label style="display:flex; align-items:center; gap:6px; cursor:pointer; font-weight:600; font-size:0.88rem;">
+            <input type="checkbox" id="chk-random-enabled" ${cfg.random_enabled ? "checked" : ""} />
+            <span>🎲 Zufallsauswahl (Randomizer)</span>
+          </label>
+          ${cfg.random_enabled ? `
+            <div style="display:flex; align-items:center; gap:6px; font-size:0.85rem; margin-left:8px;">
+              <span style="color:var(--secondary-text-color, #666);">Auswahl:</span>
+              <input type="number" id="input-random-count" min="1" max="50" value="${cfg.random_count || 1}" style="width:55px; padding:3px 6px; border:1px solid var(--divider-color, #ccc); border-radius:4px; font-size:0.85rem;" />
+              <span style="color:var(--secondary-text-color, #666);">Artikel</span>
+            </div>
+            <span class="badge-random-info" style="font-size:0.75rem; background:#ede7f6; color:#512da8; padding:2px 8px; border-radius:12px; font-weight:600;">
+              Gewichtet (${cfg.random_count || 1} aus ${openItems.length})
+            </span>
+            <button class="btn-outline" id="btn-reset-weights" style="font-size:0.75rem; padding:2px 8px;" title="Alle Artikel-Gewichte auf 1.0 zurücksetzen">↺ Gewichte reset</button>
+          ` : ""}
+        </div>
+      </div>
+    `;
     if (listItems.length === 0) {
-      container.innerHTML = `<div style="padding: 24px; text-align: center; color: #888;">Diese Liste ist noch leer. Nutze die Suche links, um Artikel hinzuzufügen!</div>`;
+      container.innerHTML = `
+        ${configBarHtml}
+        <div style="padding: 24px; text-align: center; color: #888;">Diese Liste ist noch leer. Nutze die Suche links, um Artikel hinzuzufügen!</div>
+      `;
+      this._bindConfigBarEvents(container, cfg);
       return;
     }
 
     container.innerHTML = `
+      ${configBarHtml}
       <table class="list-items-table">
         <tbody>
           ${openItems
@@ -809,7 +931,10 @@ class FlaschenpostView extends HTMLElement {
                 <input type="checkbox" class="chk-item" data-uid="${item.uid}" />
               </td>
               <td>
-                <div class="item-text">${item.summary}</div>
+                <div class="item-text" style="display:inline-flex; align-items:center; flex-wrap:wrap; gap:4px;">
+                  <span>${item.summary}</span>
+                  ${cfg.random_enabled ? `<span class="badge-weight" title="Gewichtung: ${item.weight || 1} (Erhöht sich, solange dieser Artikel nicht gezogen wird)">🎲 ${item.weight || 1}x</span>` : ""}
+                </div>
                 ${item.last_resolved_note ? `<div class="item-note">💡 ${item.last_resolved_note}</div>` : ""}
               </td>
               <td style="text-align: right; white-space: nowrap;">
@@ -852,6 +977,8 @@ class FlaschenpostView extends HTMLElement {
         </tbody>
       </table>
     `;
+
+    this._bindConfigBarEvents(container, cfg);
 
     container.querySelectorAll(".chk-item[data-uid]").forEach((chk) => {
       chk.addEventListener("change", () => {
@@ -1493,6 +1620,41 @@ class FlaschenpostView extends HTMLElement {
           padding: 2px 6px;
           border-radius: 4px;
           font-size: 0.75rem;
+        }
+
+        .list-config-bar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          background: var(--secondary-background-color, #f8f9fa);
+          border: 1px solid var(--divider-color, #e0e0e0);
+          border-radius: 8px;
+          padding: 8px 12px;
+          margin-bottom: 12px;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+
+        .badge-weight {
+          display: inline-flex;
+          align-items: center;
+          font-size: 0.75rem;
+          font-weight: 700;
+          background: #f3e5f5;
+          color: #7b1fa2;
+          padding: 1px 6px;
+          border-radius: 4px;
+        }
+
+        .badge-random-info {
+          display: inline-flex;
+          align-items: center;
+          font-size: 0.75rem;
+          font-weight: 600;
+          background: #ede7f6;
+          color: #512da8;
+          padding: 2px 8px;
+          border-radius: 12px;
         }
 
         .list-items-table {

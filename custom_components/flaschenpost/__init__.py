@@ -40,11 +40,13 @@ from .const import (
     SERVICE_GET_CATEGORIES,
     SERVICE_GET_FAVORITES,
     SERVICE_GET_SHOPPING_LISTS,
+    SERVICE_IMPORT_CART_TO_LIST,
     SERVICE_PLACE_ORDER,
     SERVICE_REORDER_LAST_ORDER,
     SERVICE_SAVE_SHOPPING_LIST,
     SERVICE_SEARCH_PRODUCTS,
     SERVICE_SELECT_DELIVERY_SLOT,
+    SERVICE_SET_LIST_CONFIG,
     SERVICE_SYNC_LIST_TO_CART,
     SORT_OPTIONS,
     SORT_RELEVANCE,
@@ -187,7 +189,7 @@ async def _async_fetch_external_ha_todo_items(
 
 PANEL_URL_PATH = "flaschenpost"
 FRONTEND_URL = "/flaschenpost_static"
-PANEL_JS_VERSION = "2.0.3"
+PANEL_JS_VERSION = "2.0.4"
 
 
 async def _async_register_frontend_panel(hass: HomeAssistant) -> None:
@@ -309,6 +311,28 @@ def _async_register_services(hass: HomeAssistant) -> None:
     """Register domain services once."""
     if hass.services.has_service(DOMAIN, SERVICE_PLACE_ORDER):
         return
+
+    async def handle_import_cart(call: ServiceCall) -> ServiceResponse:
+        coord = _resolve_coordinator(hass, call.data.get("config_entry_id"))
+        list_name = str(call.data["list_name"]).strip()
+        items = await coord.shopping_list.async_import_cart_to_new_list(list_name)
+        coord.async_update_listeners()
+        return {
+            "list_name": list_name,
+            "imported_count": len(items),
+            "items": [it.to_dict() for it in items],
+        }
+
+    async def handle_set_list_config(call: ServiceCall) -> ServiceResponse:
+        coord = _resolve_coordinator(hass, call.data.get("config_entry_id"))
+        list_name = str(call.data["list_name"]).strip()
+        cfg = await coord.shopping_list.async_set_list_config(
+            list_name,
+            random_enabled=call.data.get("random_enabled"),
+            random_count=call.data.get("random_count"),
+        )
+        coord.async_update_listeners()
+        return {"list_name": list_name, **cfg.to_dict()}
 
     async def handle_search_products(call: ServiceCall) -> ServiceResponse:
         coord = _resolve_coordinator(hass, call.data.get("config_entry_id"))
@@ -615,6 +639,34 @@ def _async_register_services(hass: HomeAssistant) -> None:
             "order_id": order.get("id"),
             "order_number": order.get("orderNumber"),
         }
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_IMPORT_CART_TO_LIST,
+        handle_import_cart,
+        schema=vol.Schema(
+            {
+                vol.Optional("config_entry_id"): cv.string,
+                vol.Required("list_name"): cv.string,
+            }
+        ),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_LIST_CONFIG,
+        handle_set_list_config,
+        schema=vol.Schema(
+            {
+                vol.Optional("config_entry_id"): cv.string,
+                vol.Required("list_name"): cv.string,
+                vol.Optional("random_enabled"): cv.boolean,
+                vol.Optional("random_count"): cv.positive_int,
+            }
+        ),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
 
     hass.services.async_register(
         DOMAIN,

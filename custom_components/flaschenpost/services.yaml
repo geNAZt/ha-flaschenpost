@@ -478,3 +478,50 @@ place_order:
       selector:
         config_entry:
           integration: flaschenpost
+
+import_cart_to_list:
+  name: Import cart into shopping list
+  description: Import all items currently in your Flaschenpost cart into a new shopping list, pinned by SKU.
+  fields:
+    list_name:
+      name: Shopping list name
+      description: Name of the new shopping list to create or overwrite.
+      required: true
+      example: "Warenkorb Import"
+      selector:
+        text:
+    config_entry_id:
+      name: Account config entry ID
+      selector:
+        config_entry:
+          integration: flaschenpost
+
+set_shopping_list_config:
+  name: Configure shopping list randomizer
+  description: Configure weighted random selection settings for a named shopping list.
+  fields:
+    list_name:
+      name: Shopping list name
+      description: Target shopping list name.
+      required: true
+      example: "Snacks"
+      selector:
+        text:
+    random_enabled:
+      name: Randomizer enabled
+      description: Enable weighted random picking for this shopping list when resolving to cart.
+      selector:
+        boolean:
+    random_count:
+      name: Amount of items to pick
+      description: Number of items to pick randomly from this list.
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 100
+    config_entry_id:
+      name: Account config entry ID
+      selector:
+        config_entry:
+          integration: flaschenpost

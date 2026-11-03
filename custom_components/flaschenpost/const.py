@@ -96,3 +96,8 @@ SERVICE_REORDER_LAST_ORDER = "reorder_last_order"
 SERVICE_SELECT_DELIVERY_SLOT = "select_delivery_slot"
 SERVICE_PLACE_ORDER = "place_order"
 SERVICE_BUY_CART = "buy_cart"
+SERVICE_IMPORT_CART_TO_LIST = "import_cart_to_list"
+SERVICE_SET_LIST_CONFIG = "set_shopping_list_config"
+
+DEFAULT_ITEM_WEIGHT: float = 1.0
+
