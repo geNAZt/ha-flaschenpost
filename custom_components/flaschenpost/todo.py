@@ -1,8 +1,6 @@
-"""To-Do / Shopping list platform for Flaschenpost."""
+"""To-Do platform for Flaschenpost (live cart)."""
 
 from __future__ import annotations
-
-import re
 
 from homeassistant.components.todo import (
     TodoItem,
@@ -11,12 +9,12 @@ from homeassistant.components.todo import (
     TodoListEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .api import cents_to_eur
-from .const import DEFAULT_SHOPPING_LIST_NAME, DOMAIN, ORIGIN_CART, ORIGIN_SEARCH
+from .const import DOMAIN, ORIGIN_CART, ORIGIN_SEARCH
 from .coordinator import FlaschenpostCoordinator
 from .entity import FlaschenpostEntity
 from .shopping_list import (
@@ -27,117 +25,14 @@ from .shopping_list import (
 )
 
 
-def _slugify_list_key(list_name: str) -> str:
-    if list_name.strip().lower() == DEFAULT_SHOPPING_LIST_NAME.lower():
-        return "shopping_list"
-    slug = re.sub(r"[^a-z0-9]+", "_", list_name.strip().lower()).strip("_")
-    return f"shopping_list_{slug or 'custom'}"
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Flaschenpost Named Shopping Lists and Live Cart To-Do entities."""
+    """Set up Flaschenpost Live Cart To-Do entity."""
     coordinator: FlaschenpostCoordinator = hass.data[DOMAIN][entry.entry_id]
-    registered_keys: set[str] = set()
-
-    initial_entities: list[TodoListEntity] = [FlaschenpostCartTodoEntity(coordinator)]
-    for lname in coordinator.shopping_list.list_names:
-        key = _slugify_list_key(lname)
-        if key not in registered_keys:
-            registered_keys.add(key)
-            initial_entities.append(
-                FlaschenpostShoppingListTodoEntity(coordinator, lname)
-            )
-
-    async_add_entities(initial_entities)
-
-    @callback
-    def _on_new_list_created(new_list_name: str) -> None:
-        key = _slugify_list_key(new_list_name)
-        if key in registered_keys:
-            return
-        registered_keys.add(key)
-        async_add_entities(
-            [FlaschenpostShoppingListTodoEntity(coordinator, new_list_name)]
-        )
-
-    coordinator.shopping_list.register_list_added_callback(_on_new_list_created)
-
-
-class FlaschenpostShoppingListTodoEntity(FlaschenpostEntity, TodoListEntity):
-    """Persistent Home Assistant Flaschenpost shopping list (lazily resolved at order/cart time)."""
-
-    _attr_icon = "mdi:clipboard-list-outline"
-    _attr_supported_features = (
-        TodoListEntityFeature.CREATE_TODO_ITEM
-        | TodoListEntityFeature.UPDATE_TODO_ITEM
-        | TodoListEntityFeature.DELETE_TODO_ITEM
-        | TodoListEntityFeature.SET_DESCRIPTION_ON_ITEM
-    )
-
-    def __init__(
-        self,
-        coordinator: FlaschenpostCoordinator,
-        list_name: str = DEFAULT_SHOPPING_LIST_NAME,
-    ) -> None:
-        key = _slugify_list_key(list_name)
-        super().__init__(coordinator, key)
-        self._list_name = list_name
-        if list_name.strip().lower() == DEFAULT_SHOPPING_LIST_NAME.lower():
-            self._attr_translation_key = "shopping_list"
-        else:
-            self._attr_name = f"Shopping list: {list_name}"
-
-    @property
-    def todo_items(self) -> list[TodoItem]:
-        items: list[TodoItem] = []
-        for entry in self.coordinator.shopping_list.get_list_items(self._list_name):
-            items.append(
-                TodoItem(
-                    uid=entry.uid,
-                    summary=entry.summary,
-                    description=entry.last_resolved_note,
-                    status=(
-                        TodoItemStatus.COMPLETED
-                        if entry.completed
-                        else TodoItemStatus.NEEDS_ACTION
-                    ),
-                )
-            )
-        return items
-
-    async def async_create_todo_item(self, item: TodoItem) -> None:
-        await self.coordinator.shopping_list.async_add_item(
-            summary=item.summary or "",
-            description=item.description,
-            list_name=self._list_name,
-        )
-        self.async_write_ha_state()
-
-    async def async_update_todo_item(self, item: TodoItem) -> None:
-        if not item.uid:
-            return
-        completed = (
-            item.status == TodoItemStatus.COMPLETED
-            if item.status is not None
-            else None
-        )
-        await self.coordinator.shopping_list.async_update_item(
-            item.uid,
-            summary=item.summary,
-            completed=completed,
-            list_name=self._list_name,
-        )
-        self.async_write_ha_state()
-
-    async def async_delete_todo_items(self, uids: list[str]) -> None:
-        await self.coordinator.shopping_list.async_remove_items(
-            uids, list_name=self._list_name
-        )
-        self.async_write_ha_state()
+    async_add_entities([FlaschenpostCartTodoEntity(coordinator)])
 
 
 class FlaschenpostCartTodoEntity(FlaschenpostEntity, TodoListEntity):

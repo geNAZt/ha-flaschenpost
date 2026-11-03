@@ -60,6 +60,7 @@ from .shopping_list import (
     parse_shopping_item_spec,
     resolve_sort_alias,
 )
+from .storage import FlaschenpostSqliteStorage
 from .websocket_api import async_register_websocket_commands
 
 _LOGGER = logging.getLogger(__name__)
@@ -261,11 +262,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         email=entry.data[CONF_EMAIL],
         password=entry.data[CONF_PASSWORD],
     )
+    db_path = hass.config.path("flaschenpost.db") if hasattr(hass, "config") and hasattr(hass.config, "path") else "flaschenpost.db"
+    storage = FlaschenpostSqliteStorage(db_path=db_path, hass=hass)
     store: Store[dict[str, Any]] = Store(
         hass, STORAGE_VERSION, f"{STORAGE_KEY_PREFIX}_{entry.entry_id}"
     )
-    shopping_list = FlaschenpostShoppingListManager(client=client, store=store)
+    shopping_list = FlaschenpostShoppingListManager(
+        client=client, storage=storage, store=store
+    )
     await shopping_list.async_load()
+
+    # Clean up legacy shopping list To-Do entities (keep only live cart To-Do entity)
+    try:
+        from homeassistant.helpers import entity_registry as er
+
+        ent_reg = er.async_get(hass)
+        entries = er.async_entries_for_config_entry(ent_reg, entry.entry_id)
+        for ent in entries:
+            if ent.domain == "todo" and (
+                ent.unique_id == "shopping_list"
+                or ent.unique_id.startswith("shopping_list_")
+            ):
+                ent_reg.async_remove(ent.entity_id)
+    except Exception as err:
+        _LOGGER.debug("Could not clean up legacy shopping list todo entities: %s", err)
 
     # Seed initial shopping lists configured during setup flow if present
     initial_seed = entry.data.get(CONF_INITIAL_SHOPPING_LISTS)

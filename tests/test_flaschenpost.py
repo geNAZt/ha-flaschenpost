@@ -56,7 +56,7 @@ if "custom_components.flaschenpost" not in sys.modules:
     fp_pkg.__path__ = [str(_PKG_DIR)]
     sys.modules.setdefault("custom_components", cc_pkg)
     sys.modules["custom_components.flaschenpost"] = fp_pkg
-    for mod_name in ("const", "api", "shopping_list", "websocket_api"):
+    for mod_name in ("const", "api", "shopping_list", "storage", "websocket_api"):
         spec = importlib.util.spec_from_file_location(
             f"custom_components.flaschenpost.{mod_name}",
             _PKG_DIR / f"{mod_name}.py",
@@ -84,6 +84,7 @@ from custom_components.flaschenpost.api import (
 from custom_components.flaschenpost.const import (
     CONF_DELIVERY_LOCATION,
     CONF_WAREHOUSE_ID,
+    DEFAULT_SHOPPING_LIST_NAME,
     PAYMENT_CREDIT_CARD,
     PAYMENT_SEPA,
     SERVICE_BUY_CART,
@@ -106,6 +107,7 @@ from custom_components.flaschenpost.shopping_list import (
     parse_shopping_item_spec,
     parse_shopping_item_summary,
 )
+from custom_components.flaschenpost.storage import FlaschenpostSqliteStorage
 from custom_components.flaschenpost.websocket_api import (
     async_register_websocket_commands,
     ws_add_item,
@@ -2002,6 +2004,165 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             await mgr.async_reset_list_weights("Snacks")
             for it in mgr.get_list_items("Snacks"):
                 self.assertEqual(it.weight, 1.0)
+
+        asyncio.run(_run())
+
+
+    def test_sqlite_storage_and_legacy_todo_migration(self) -> None:
+        """Verify SQLite persistence engine, CRUD operations, and one-time legacy Store migration."""
+        import sqlite3
+        import tempfile
+
+        async def _run() -> None:
+            fake_client = _FakeApiClient()
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = Path(tmp_dir) / "flaschenpost.db"
+
+                # 1. Mock legacy store with v2 shopping lists format
+                class _MockLegacyStore:
+                    def __init__(self, data: dict[str, Any]) -> None:
+                        self._data = data
+
+                    async def async_load(self) -> dict[str, Any]:
+                        return self._data
+
+                    async def async_save(self, data: dict[str, Any]) -> None:
+                        self._data = data
+
+                legacy_data = {
+                    "lists": {
+                        "Weekly Grocery": [
+                            {
+                                "uid": "item-1",
+                                "summary": "1kg Naturjoghurt #28435",
+                                "query": "Naturjoghurt",
+                                "category": None,
+                                "unit_type": "weight_g",
+                                "target_amount_base": 1000.0,
+                                "quantity": 1,
+                                "article_id": 28435,
+                                "sort_by": None,
+                                "negative_keywords": ["zucker"],
+                                "completed": False,
+                                "weight": 2.5,
+                            }
+                        ],
+                        "Drinks": [
+                            {
+                                "uid": "item-2",
+                                "summary": "Pepsi Zero Zucker #1838",
+                                "query": "Pepsi Zero",
+                                "category": "Getränke",
+                                "unit_type": "unit",
+                                "target_amount_base": 1.0,
+                                "quantity": 2,
+                                "article_id": 1838,
+                                "sort_by": None,
+                                "negative_keywords": [],
+                                "completed": True,
+                                "weight": 1.0,
+                            }
+                        ],
+                    },
+                    "list_configs": {
+                        "Weekly Grocery": {
+                            "random_enabled": True,
+                            "random_count": 3,
+                        }
+                    },
+                }
+                legacy_store = _MockLegacyStore(legacy_data)
+
+                # 2. Initialize FlaschenpostShoppingListManager with SQLite storage and legacy store
+                storage = FlaschenpostSqliteStorage(db_path=db_path)
+                mgr = FlaschenpostShoppingListManager(
+                    client=fake_client,  # type: ignore[arg-type]
+                    storage=storage,
+                    store=legacy_store,
+                )
+
+                await mgr.async_load()
+
+                # Verify migrated lists and configurations
+                self.assertIn("Weekly Grocery", mgr.list_names)
+                self.assertIn("Drinks", mgr.list_names)
+                self.assertIn(DEFAULT_SHOPPING_LIST_NAME, mgr.list_names)
+
+                wg_items = mgr.get_list_items("Weekly Grocery")
+                self.assertEqual(len(wg_items), 1)
+                self.assertEqual(wg_items[0].summary, "1kg Naturjoghurt #28435")
+                self.assertEqual(wg_items[0].article_id, 28435)
+                self.assertEqual(wg_items[0].weight, 2.5)
+                self.assertEqual(wg_items[0].negative_keywords, ["zucker"])
+
+                drinks_items = mgr.get_list_items("Drinks")
+                self.assertEqual(len(drinks_items), 1)
+                self.assertEqual(drinks_items[0].completed, True)
+
+                wg_cfg = mgr.get_list_config("Weekly Grocery")
+                self.assertTrue(wg_cfg.random_enabled)
+                self.assertEqual(wg_cfg.random_count, 3)
+
+                # Verify metadata table in SQLite
+                conn = sqlite3.connect(str(db_path))
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM metadata WHERE key = 'todo_migrated';")
+                row = cursor.fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row[0], "true")
+                conn.close()
+
+                # Verify migration is NOT re-run if store data changes afterwards
+                legacy_store._data = {"lists": {"Tampered List": []}}
+                storage.close()
+
+                # 3. Reload from SQLite with a new manager instance and verify persistence
+                storage_reloaded = FlaschenpostSqliteStorage(db_path=db_path)
+                mgr2 = FlaschenpostShoppingListManager(
+                    client=fake_client,  # type: ignore[arg-type]
+                    storage=storage_reloaded,
+                    store=legacy_store,
+                )
+                await mgr2.async_load()
+                self.assertNotIn("Tampered List", mgr2.list_names)
+                self.assertIn("Weekly Grocery", mgr2.list_names)
+                self.assertEqual(len(mgr2.get_list_items("Weekly Grocery")), 1)
+
+                # 4. Test CRUD operations via manager persisting to SQLite
+                # Add item
+                new_item = await mgr2.async_add_item(
+                    summary="500g Heidelbeeren !bio",
+                    list_name="Weekly Grocery",
+                )
+                self.assertEqual(len(mgr2.get_list_items("Weekly Grocery")), 2)
+
+                # Update item
+                await mgr2.async_update_item(
+                    new_item.uid,
+                    summary="500g Heidelbeeren [€/kg]",
+                    completed=True,
+                    list_name="Weekly Grocery",
+                )
+                updated_items = mgr2.get_list_items("Weekly Grocery")
+                it_updated = next(x for x in updated_items if x.uid == new_item.uid)
+                self.assertTrue(it_updated.completed)
+                self.assertEqual(it_updated.sort_by, SORT_PRICE_PER_KG)
+
+                # Delete list
+                await mgr2.async_delete_named_list("Drinks")
+                self.assertNotIn("Drinks", mgr2.list_names)
+
+                # 5. Reload again to verify changes are stored in SQLite
+                storage_reloaded.close()
+                storage3 = FlaschenpostSqliteStorage(db_path=db_path)
+                mgr3 = FlaschenpostShoppingListManager(
+                    client=fake_client,  # type: ignore[arg-type]
+                    storage=storage3,
+                )
+                await mgr3.async_load()
+                self.assertNotIn("Drinks", mgr3.list_names)
+                self.assertEqual(len(mgr3.get_list_items("Weekly Grocery")), 2)
+                storage3.close()
 
         asyncio.run(_run())
 

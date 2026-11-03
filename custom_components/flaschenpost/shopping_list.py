@@ -597,14 +597,22 @@ class _MergedRequirement:
 class FlaschenpostShoppingListManager:
     """Manages multiple named Flaschenpost shopping lists, interactive previews, and lazy cart resolution."""
 
-    def __init__(self, client: FlaschenpostApiClient, store: Any | None = None) -> None:
-        """Initialize multi-list shopping list manager."""
+    def __init__(
+        self,
+        client: FlaschenpostApiClient,
+        storage: Any | None = None,
+        store: Any | None = None,
+    ) -> None:
+        """Initialize multi-list shopping list manager with SQLite storage."""
         self._client = client
+        self._storage = storage
         self._store = store
         self._lists: dict[str, list[ShoppingListItem]] = {
             DEFAULT_SHOPPING_LIST_NAME: []
         }
-        self._list_configs: dict[str, ShoppingListConfig] = {}
+        self._list_configs: dict[str, ShoppingListConfig] = {
+            DEFAULT_SHOPPING_LIST_NAME: ShoppingListConfig()
+        }
         self._list_added_callbacks: list[Callable[[str], None]] = []
         self._list_deleted_callbacks: list[Callable[[str], None]] = []
 
@@ -680,7 +688,22 @@ class FlaschenpostShoppingListManager:
                 )
 
     async def async_load(self) -> None:
-        """Load persisted shopping lists from Home Assistant Store (supports v1 & v2)."""
+        """Load persisted shopping lists and configs from SQLite storage or legacy Store."""
+        if self._storage is not None:
+            await self._storage.async_init()
+            await self._storage.async_migrate_legacy_data(
+                legacy_store=self._store,
+                initial_lists=self._lists,
+                initial_configs=self._list_configs,
+            )
+            lists, configs = await self._storage.async_get_all_data()
+            if DEFAULT_SHOPPING_LIST_NAME not in lists:
+                lists = {DEFAULT_SHOPPING_LIST_NAME: [], **lists}
+                configs[DEFAULT_SHOPPING_LIST_NAME] = ShoppingListConfig()
+            self._lists = lists
+            self._list_configs = configs
+            return
+
         if self._store is None:
             return
         raw = await self._store.async_load()
@@ -749,7 +772,10 @@ class FlaschenpostShoppingListManager:
         await self.async_save()
 
     async def async_save(self) -> None:
-        """Persist all named lists and list configurations to Home Assistant Store."""
+        """Persist all named lists and list configurations to SQLite storage (or legacy Store)."""
+        if self._storage is not None:
+            await self._storage.async_save_all(self._lists, self._list_configs)
+            return
         if self._store is None:
             return
         await self._store.async_save({
@@ -831,6 +857,8 @@ class FlaschenpostShoppingListManager:
         else:
             self._lists.pop(key, None)
             self._list_configs.pop(key, None)
+            if self._storage is not None:
+                await self._storage.async_delete_list(key)
             for cb in self._list_deleted_callbacks:
                 cb(key)
         await self.async_save()
