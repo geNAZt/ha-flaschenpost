@@ -56,11 +56,10 @@ MENU_ORDER_PREFS = "order_prefs"
 MENU_DONE = "done"
 
 _SORT_SELECT_OPTIONS = [
-    {"value": "auto", "label": "Automatic (unit-based cheapest)"},
+    {"value": SORT_PRICE, "label": "Cheapest total price (€)"},
     {"value": SORT_PRICE_PER_KG, "label": "Cheapest per kg (€/kg)"},
     {"value": SORT_PRICE_PER_LITER, "label": "Cheapest per liter (€/L)"},
     {"value": SORT_PRICE_PER_UNIT, "label": "Cheapest per unit (€/unit)"},
-    {"value": SORT_PRICE, "label": "Cheapest pack price (€)"},
     {"value": SORT_RELEVANCE, "label": "Relevance"},
 ]
 
@@ -311,13 +310,19 @@ class FlaschenpostConfigFlow(ConfigFlow, domain=DOMAIN):
             else:
                 cat = user_input.get("category") or None
                 amt = user_input.get("amount_prefix") or None
-                sort_val = user_input.get("sort_by") or None
+                sort_val = user_input.get("sort_by") or SORT_PRICE
                 preview = await self._temp_mgr.async_preview_search(
                     q,
                     amount_prefix=amt,
                     category=cat,
                     sort_by=sort_val,
                 )
+                self.context["preview_query_params"] = {
+                    "raw_query": q,
+                    "amount_prefix": amt,
+                    "category": cat,
+                    "sort_by": sort_val,
+                }
                 self.context["preview_result"] = preview
                 return await self.async_step_preview_result()
 
@@ -326,7 +331,7 @@ class FlaschenpostConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required("query"): str,
                 vol.Optional("amount_prefix", default=""): str,
                 vol.Optional("category", default=""): vol.In(cat_choices),
-                vol.Optional("sort_by", default="auto"): vol.In(
+                vol.Optional("sort_by", default=SORT_PRICE): vol.In(
                     {opt["value"]: opt["label"] for opt in _SORT_SELECT_OPTIONS}
                 ),
             }
@@ -345,6 +350,12 @@ class FlaschenpostConfigFlow(ConfigFlow, domain=DOMAIN):
         preview = self.context.get("preview_result") or {}
         spec = preview.get("spec")
         lazy_summary = preview.get("lazy_summary", "")
+        params = self.context.get("preview_query_params") or {}
+        current_sort = (
+            (spec.sort_by if spec else None)
+            or params.get("sort_by")
+            or SORT_PRICE
+        )
 
         candidates = preview.get("candidates") or []
         add_options: dict[str, str] = {
@@ -356,14 +367,37 @@ class FlaschenpostConfigFlow(ConfigFlow, domain=DOMAIN):
                 f"Pin #{aid} {cand.get('name')} ({cand.get('description') or '1x'}) "
                 f"[{cand['packs']}x = {cand['line_total_eur']:.2f} €]"
             )
+        add_options["refresh_sort"] = "↻ Update preview with selected sort order"
         add_options["skip"] = "Do not add (back to menu)"
 
         existing_lists = list(self._temp_mgr.list_names)
         list_choices = {name: name for name in existing_lists}
         list_choices["__new__"] = "+ Create new list..."
+        sort_choices = {opt["value"]: opt["label"] for opt in _SORT_SELECT_OPTIONS}
 
         if user_input is not None:
+            new_sort = user_input.get("sort_by") or SORT_PRICE
             choice = user_input.get("chosen_option")
+
+            if choice == "refresh_sort" or new_sort != current_sort:
+                raw_q = params.get("raw_query") or (spec.query if spec else "")
+                amt = params.get("amount_prefix")
+                cat = params.get("category") or (spec.category if spec else None)
+                updated_preview = await self._temp_mgr.async_preview_search(
+                    raw_q,
+                    amount_prefix=amt,
+                    category=cat,
+                    sort_by=new_sort,
+                )
+                self.context["preview_query_params"] = {
+                    "raw_query": raw_q,
+                    "amount_prefix": amt,
+                    "category": cat,
+                    "sort_by": new_sort,
+                }
+                self.context["preview_result"] = updated_preview
+                return await self.async_step_preview_result()
+
             target_list = user_input.get("target_list")
             new_list_name = user_input.get("new_list_name", "").strip()
             final_list_name = (
@@ -395,6 +429,7 @@ class FlaschenpostConfigFlow(ConfigFlow, domain=DOMAIN):
         schema = vol.Schema(
             {
                 vol.Required("chosen_option", default="lazy"): vol.In(add_options),
+                vol.Required("sort_by", default=current_sort): vol.In(sort_choices),
                 vol.Required(
                     "target_list",
                     default=existing_lists[0] if existing_lists else DEFAULT_SHOPPING_LIST_NAME,
@@ -651,13 +686,19 @@ class FlaschenpostOptionsFlow(OptionsFlow):
             else:
                 cat = user_input.get("category") or None
                 amt = user_input.get("amount_prefix") or None
-                sort_val = user_input.get("sort_by") or None
+                sort_val = user_input.get("sort_by") or SORT_PRICE
                 preview = await coord.shopping_list.async_preview_search(
                     q,
                     amount_prefix=amt,
                     category=cat,
                     sort_by=sort_val,
                 )
+                self.context["options_preview_query_params"] = {
+                    "raw_query": q,
+                    "amount_prefix": amt,
+                    "category": cat,
+                    "sort_by": sort_val,
+                }
                 self.context["options_preview_result"] = preview
                 return await self.async_step_preview_result()
 
@@ -666,7 +707,7 @@ class FlaschenpostOptionsFlow(OptionsFlow):
                 vol.Required("query"): str,
                 vol.Optional("amount_prefix", default=""): str,
                 vol.Optional("category", default=""): vol.In(cat_choices),
-                vol.Optional("sort_by", default="auto"): vol.In(
+                vol.Optional("sort_by", default=SORT_PRICE): vol.In(
                     {opt["value"]: opt["label"] for opt in _SORT_SELECT_OPTIONS}
                 ),
             }
@@ -686,6 +727,12 @@ class FlaschenpostOptionsFlow(OptionsFlow):
         preview = self.context.get("options_preview_result") or {}
         spec = preview.get("spec")
         lazy_summary = preview.get("lazy_summary", "")
+        params = self.context.get("options_preview_query_params") or {}
+        current_sort = (
+            (spec.sort_by if spec else None)
+            or params.get("sort_by")
+            or SORT_PRICE
+        )
 
         candidates = preview.get("candidates") or []
         add_options: dict[str, str] = {
@@ -697,14 +744,37 @@ class FlaschenpostOptionsFlow(OptionsFlow):
                 f"Pin #{aid} {cand.get('name')} ({cand.get('description') or '1x'}) "
                 f"[{cand['packs']}x = {cand['line_total_eur']:.2f} €]"
             )
+        add_options["refresh_sort"] = "↻ Update preview with selected sort order"
         add_options["skip"] = "Do not add (back to menu)"
 
         existing_lists = list(coord.shopping_list.list_names)
         list_choices = {name: name for name in existing_lists}
         list_choices["__new__"] = "+ Create new list..."
+        sort_choices = {opt["value"]: opt["label"] for opt in _SORT_SELECT_OPTIONS}
 
         if user_input is not None:
+            new_sort = user_input.get("sort_by") or SORT_PRICE
             choice = user_input.get("chosen_option")
+
+            if choice == "refresh_sort" or new_sort != current_sort:
+                raw_q = params.get("raw_query") or (spec.query if spec else "")
+                amt = params.get("amount_prefix")
+                cat = params.get("category") or (spec.category if spec else None)
+                updated_preview = await coord.shopping_list.async_preview_search(
+                    raw_q,
+                    amount_prefix=amt,
+                    category=cat,
+                    sort_by=new_sort,
+                )
+                self.context["options_preview_query_params"] = {
+                    "raw_query": raw_q,
+                    "amount_prefix": amt,
+                    "category": cat,
+                    "sort_by": new_sort,
+                }
+                self.context["options_preview_result"] = updated_preview
+                return await self.async_step_preview_result()
+
             target_list = user_input.get("target_list")
             new_list_name = user_input.get("new_list_name", "").strip()
             final_list_name = (
@@ -737,6 +807,7 @@ class FlaschenpostOptionsFlow(OptionsFlow):
         schema = vol.Schema(
             {
                 vol.Required("chosen_option", default="lazy"): vol.In(add_options),
+                vol.Required("sort_by", default=current_sort): vol.In(sort_choices),
                 vol.Required(
                     "target_list",
                     default=existing_lists[0] if existing_lists else DEFAULT_SHOPPING_LIST_NAME,

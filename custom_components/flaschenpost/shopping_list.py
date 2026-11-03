@@ -56,6 +56,9 @@ _SORT_TAG_ALIASES: dict[str, str] = {
     "relevance": SORT_RELEVANCE,
     "price": SORT_PRICE,
     "cheapest": SORT_PRICE,
+    "total": SORT_PRICE,
+    "total_price": SORT_PRICE,
+    "auto": SORT_PRICE,
     "€": SORT_PRICE,
     "eur": SORT_PRICE,
     "price_per_unit": SORT_PRICE_PER_UNIT,
@@ -171,11 +174,7 @@ def format_shopping_spec_summary(spec: ParsedShoppingSpec) -> str:
             SORT_PRICE: "price",
             SORT_RELEVANCE: "relevance",
         }.get(spec.sort_by)
-        if reverse_tag and not (
-            (spec.unit_type == UNIT_TYPE_WEIGHT_G and spec.sort_by == SORT_PRICE_PER_KG)
-            or (spec.unit_type == UNIT_TYPE_VOLUME_ML and spec.sort_by == SORT_PRICE_PER_LITER)
-            or (spec.unit_type == UNIT_TYPE_CRATE and spec.sort_by == SORT_PRICE_PER_LITER)
-        ):
+        if reverse_tag and spec.sort_by != SORT_PRICE:
             sort_tag = f" [{reverse_tag}]"
 
     core_name = f"{spec.category}::{spec.query}" if spec.category else spec.query
@@ -357,6 +356,8 @@ def build_preview_spec(
         resolved_sort = resolve_sort_alias(sort_by) or sort_by.strip().lower()
         if resolved_sort in SORT_OPTIONS:
             base_spec.sort_by = resolved_sort
+    elif sort_by and sort_by.strip().lower() == "auto":
+        base_spec.sort_by = SORT_PRICE
 
     return base_spec
 
@@ -822,34 +823,26 @@ class FlaschenpostShoppingListManager:
             sort_by=spec.sort_by,
         )
 
-        if spec.sort_by:
-            search_sort = spec.sort_by
-        elif spec.unit_type == UNIT_TYPE_WEIGHT_G:
-            search_sort = SORT_PRICE_PER_KG
-        elif spec.unit_type in (UNIT_TYPE_VOLUME_ML, UNIT_TYPE_CRATE):
-            search_sort = SORT_PRICE_PER_LITER
-        else:
-            search_sort = SORT_PRICE
+        effective_sort = spec.sort_by or SORT_PRICE
+        search_sort = (
+            effective_sort
+            if effective_sort in (SORT_PRICE_PER_KG, SORT_PRICE_PER_LITER, SORT_PRICE_PER_UNIT, SORT_RELEVANCE)
+            else SORT_PRICE
+        )
 
         candidates_raw: list[dict[str, Any]] = []
         if hasattr(self._client, "async_search_products"):
             candidates_raw = await self._client.async_search_products(
                 spec.query,
-                limit=max(limit * 2, 12),
+                limit=max(limit * 3, 24),
                 category=spec.category,
                 sort_by=search_sort,
                 only_available=False,
                 only_crates=(spec.unit_type == UNIT_TYPE_CRATE),
             )
 
-        # Put in-stock items first while still surfacing out-of-stock matches at the bottom
-        candidates_sorted = sorted(
-            candidates_raw,
-            key=lambda c: (not bool(c.get("is_available", True)),),
-        )[:limit]
-
         enriched_candidates: list[dict[str, Any]] = []
-        for cand in candidates_sorted:
+        for cand in candidates_raw:
             plan = estimate_candidate_pack_plan(spec, cand)
             enriched_candidates.append(
                 {
@@ -857,6 +850,54 @@ class FlaschenpostShoppingListManager:
                     **plan,
                 }
             )
+
+        if effective_sort == SORT_PRICE:
+            enriched_candidates.sort(
+                key=lambda c: (
+                    not bool(c.get("is_available", True)),
+                    float(c.get("line_total_eur") or 1e9),
+                    float(
+                        c.get("price_per_kg_eur")
+                        or c.get("price_per_liter_eur")
+                        or c.get("price_per_unit_eur")
+                        or 1e9
+                    ),
+                    int(c.get("article_id") or 0),
+                )
+            )
+        elif effective_sort == SORT_PRICE_PER_KG:
+            enriched_candidates.sort(
+                key=lambda c: (
+                    not bool(c.get("is_available", True)),
+                    c.get("price_per_kg_eur") is None,
+                    float(c.get("price_per_kg_eur") or 1e9),
+                    float(c.get("line_total_eur") or 1e9),
+                )
+            )
+        elif effective_sort == SORT_PRICE_PER_LITER:
+            enriched_candidates.sort(
+                key=lambda c: (
+                    not bool(c.get("is_available", True)),
+                    c.get("price_per_liter_eur") is None,
+                    float(c.get("price_per_liter_eur") or 1e9),
+                    float(c.get("line_total_eur") or 1e9),
+                )
+            )
+        elif effective_sort == SORT_PRICE_PER_UNIT:
+            enriched_candidates.sort(
+                key=lambda c: (
+                    not bool(c.get("is_available", True)),
+                    c.get("price_per_unit_eur") is None,
+                    float(c.get("price_per_unit_eur") or 1e9),
+                    float(c.get("line_total_eur") or 1e9),
+                )
+            )
+        elif effective_sort == SORT_RELEVANCE:
+            enriched_candidates.sort(
+                key=lambda c: (not bool(c.get("is_available", True)),)
+            )
+
+        enriched_candidates = enriched_candidates[:limit]
 
         md_lines: list[str] = [f"### Live Preview for `{lazy_summary}`"]
         if winner and winner.get("article_id") is not None:

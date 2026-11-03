@@ -42,7 +42,8 @@
         "data": {
           "chosen_option": "Item to add",
           "target_list": "Target shopping list",
-          "new_list_name": "New list name (if '+ Create new list...' selected)"
+          "new_list_name": "New list name (if '+ Create new list...' selected)",
+          "sort_by": "Sort order"
         }
       },
       "edit_list": {
@@ -111,7 +112,8 @@
         "data": {
           "chosen_option": "Item to add",
           "target_list": "Target shopping list",
-          "new_list_name": "New list name (if '+ Create new list...' selected)"
+          "new_list_name": "New list name (if '+ Create new list...' selected)",
+          "sort_by": "Sort order"
         }
       },
       "add_item": {

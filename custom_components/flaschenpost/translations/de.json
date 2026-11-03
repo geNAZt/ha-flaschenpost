@@ -42,7 +42,8 @@
         "data": {
           "chosen_option": "Eintrag hinzufügen",
           "target_list": "Ziel-Einkaufsliste",
-          "new_list_name": "Neuer Listenname (falls '+ Neue Liste...' gewählt)"
+          "new_list_name": "Neuer Listenname (falls '+ Neue Liste...' gewählt)",
+          "sort_by": "Sortierung"
         }
       },
       "edit_list": {
@@ -111,7 +112,8 @@
         "data": {
           "chosen_option": "Eintrag hinzufügen",
           "target_list": "Ziel-Einkaufsliste",
-          "new_list_name": "Neuer Listenname (falls '+ Neue Liste...' gewählt)"
+          "new_list_name": "Neuer Listenname (falls '+ Neue Liste...' gewählt)",
+          "sort_by": "Sortierung"
         }
       },
       "add_item": {

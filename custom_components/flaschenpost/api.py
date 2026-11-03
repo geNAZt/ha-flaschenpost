@@ -1357,13 +1357,18 @@ class FlaschenpostApiClient:
             }
 
         if unit_type == UNIT_TYPE_WEIGHT_G:
-            effective_sort = sort_by or SORT_PRICE_PER_KG
+            effective_sort = sort_by or SORT_PRICE
+            search_sort = (
+                SORT_PRICE_PER_KG
+                if effective_sort == SORT_PRICE_PER_KG
+                else SORT_PRICE
+            )
             pool = await self.async_search_products(
                 query,
                 limit=50,
                 category=category,
                 name_contains=name_contains,
-                sort_by=effective_sort,
+                sort_by=search_sort,
                 only_available=True,
             )
             weighted = [
@@ -1392,20 +1397,30 @@ class FlaschenpostApiClient:
             if reasonable:
                 weighted = reasonable
 
-            if effective_sort == SORT_PRICE_PER_KG:
+            if effective_sort == SORT_PRICE:
+                weighted.sort(
+                    key=lambda c: (
+                        round(_packs_w(c) * float(c.get("price_eur") or 1e9), 2),
+                        c.get("price_per_kg_eur") or 1e9,
+                        abs(_actual_w(c) - target_amount_base),
+                        int(c.get("article_id") or 0),
+                    )
+                )
+            elif effective_sort == SORT_PRICE_PER_KG:
                 weighted.sort(
                     key=lambda c: (
                         c.get("price_per_kg_eur") is None,
                         c.get("price_per_kg_eur") or 1e9,
-                        _packs_w(c) * float(c.get("price_eur") or 1e9),
+                        round(_packs_w(c) * float(c.get("price_eur") or 1e9), 2),
                         _actual_w(c) - target_amount_base,
                     )
                 )
-            elif effective_sort == SORT_PRICE:
+            elif effective_sort == SORT_PRICE_PER_UNIT:
                 weighted.sort(
                     key=lambda c: (
-                        _packs_w(c) * float(c.get("price_eur") or 1e9),
-                        c.get("price_per_kg_eur") or 1e9,
+                        c.get("price_per_unit_eur") is None,
+                        c.get("price_per_unit_eur") or 1e9,
+                        round(_packs_w(c) * float(c.get("price_eur") or 1e9), 2),
                     )
                 )
 
@@ -1423,13 +1438,18 @@ class FlaschenpostApiClient:
             }
 
         if unit_type == UNIT_TYPE_VOLUME_ML:
-            effective_sort = sort_by or SORT_PRICE_PER_LITER
+            effective_sort = sort_by or SORT_PRICE
+            search_sort = (
+                SORT_PRICE_PER_LITER
+                if effective_sort == SORT_PRICE_PER_LITER
+                else SORT_PRICE
+            )
             pool = await self.async_search_products(
                 query,
                 limit=50,
                 category=category,
                 name_contains=name_contains,
-                sort_by=effective_sort,
+                sort_by=search_sort,
                 only_available=True,
             )
             volumetric = [
@@ -1460,19 +1480,29 @@ class FlaschenpostApiClient:
             if reasonable_v:
                 volumetric = reasonable_v
 
-            if effective_sort == SORT_PRICE_PER_LITER:
+            if effective_sort == SORT_PRICE:
+                volumetric.sort(
+                    key=lambda c: (
+                        round(_packs_v(c) * float(c.get("price_eur") or 1e9), 2),
+                        c.get("price_per_liter_eur") or 1e9,
+                        abs(_actual_v(c) - target_amount_base),
+                        int(c.get("article_id") or 0),
+                    )
+                )
+            elif effective_sort == SORT_PRICE_PER_LITER:
                 volumetric.sort(
                     key=lambda c: (
                         c.get("price_per_liter_eur") is None,
                         c.get("price_per_liter_eur") or 1e9,
-                        _packs_v(c) * float(c.get("price_eur") or 1e9),
+                        round(_packs_v(c) * float(c.get("price_eur") or 1e9), 2),
                     )
                 )
-            elif effective_sort == SORT_PRICE:
+            elif effective_sort == SORT_PRICE_PER_UNIT:
                 volumetric.sort(
                     key=lambda c: (
-                        _packs_v(c) * float(c.get("price_eur") or 1e9),
-                        c.get("price_per_liter_eur") or 1e9,
+                        c.get("price_per_unit_eur") is None,
+                        c.get("price_per_unit_eur") or 1e9,
+                        round(_packs_v(c) * float(c.get("price_eur") or 1e9), 2),
                     )
                 )
 
@@ -1490,18 +1520,40 @@ class FlaschenpostApiClient:
             }
 
         if unit_type == UNIT_TYPE_CRATE:
-            effective_sort = sort_by or SORT_PRICE_PER_LITER
+            effective_sort = sort_by or SORT_PRICE
+            search_sort = (
+                SORT_PRICE_PER_LITER
+                if effective_sort == SORT_PRICE_PER_LITER
+                else SORT_PRICE
+            )
             pool = await self.async_search_products(
                 query,
                 limit=25,
                 category=category,
                 name_contains=name_contains,
-                sort_by=effective_sort,
+                sort_by=search_sort,
                 only_available=True,
                 only_crates=True,
             )
             if not pool:
                 return None
+            qty_crates = max(1, math.ceil(target_amount_base - 1e-9))
+            if effective_sort == SORT_PRICE:
+                pool.sort(
+                    key=lambda c: (
+                        round(qty_crates * float(c.get("price_eur") or 1e9), 2),
+                        c.get("price_per_liter_eur") or 1e9,
+                        int(c.get("article_id") or 0),
+                    )
+                )
+            elif effective_sort == SORT_PRICE_PER_LITER:
+                pool.sort(
+                    key=lambda c: (
+                        c.get("price_per_liter_eur") is None,
+                        c.get("price_per_liter_eur") or 1e9,
+                        round(qty_crates * float(c.get("price_eur") or 1e9), 2),
+                    )
+                )
             winner = pool[0]
             qty = max(1, math.ceil(target_amount_base - 1e-9))
             return {

@@ -124,6 +124,33 @@ class _FakeApiClient:
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
         ql = query.lower()
+        if "joghurt" in ql:
+            cand_28249 = {
+                "article_id": 28249,
+                "name": "K-Classic Naturjoghurt 3,5%",
+                "description": "4 x 150g",
+                "package_weight_g": 600.0,
+                "price_eur": 0.89,
+                "price_per_kg_eur": 1.48,
+                "is_available": True,
+                "categories": ["Joghurt & Skyr", "Naturjoghurt", "Eier & Molkerei"],
+                "category_slugs": ["joghurt-skyr", "naturjoghurt"],
+            }
+            cand_28435 = {
+                "article_id": 28435,
+                "name": "K-Classic Naturjoghurt 1,5%",
+                "description": "500g",
+                "package_weight_g": 500.0,
+                "price_eur": 0.79,
+                "price_per_kg_eur": 1.58,
+                "is_available": True,
+                "categories": ["Joghurt & Skyr", "Naturjoghurt", "Eier & Molkerei"],
+                "category_slugs": ["joghurt-skyr", "naturjoghurt"],
+            }
+            res = [cand_28249, cand_28435]
+            if category:
+                res = [c for c in res if matches_category_filter(c, category)]
+            return res[:limit]
         if "milchreis" in ql:
             dry = {
                 "article_id": 10495,
@@ -209,27 +236,50 @@ class _FakeApiClient:
                 },
             }
         if "joghurt" in ql:
-            # 600g (4 x 150g) at 1.48 €/kg beats 500g at 1.58 €/kg -> 2 packs = 1200g (1.2kg)
-            pkg_g = 600.0
+            if sort_by == SORT_PRICE_PER_KG:
+                pkg_g = 600.0
+                qty = (
+                    max(1, math.ceil(target_amount_base / pkg_g - 1e-9))
+                    if unit_type == UNIT_TYPE_WEIGHT_G
+                    else max(1, round(target_amount_base))
+                )
+                return {
+                    "article_id": 28249,
+                    "quantity": qty,
+                    "unit_type": unit_type,
+                    "requested_amount_base": target_amount_base,
+                    "delivered_amount_base": qty * pkg_g,
+                    "line_total_eur": round(qty * 0.89, 2),
+                    "product": {
+                        "article_id": 28249,
+                        "name": "K-Classic Naturjoghurt 3,5%",
+                        "description": "4 x 150g",
+                        "package_weight_g": 600.0,
+                        "price_eur": 0.89,
+                        "price_per_kg_eur": 1.48,
+                    },
+                }
+            # Default / total price: 500g @ 0.79 EUR -> 2 packs = 1000g for 1.58 EUR beats 2 x 0.89 = 1.78 EUR!
+            pkg_g = 500.0
             qty = (
                 max(1, math.ceil(target_amount_base / pkg_g - 1e-9))
                 if unit_type == UNIT_TYPE_WEIGHT_G
                 else max(1, round(target_amount_base))
             )
             return {
-                "article_id": 28242,
+                "article_id": 28435,
                 "quantity": qty,
                 "unit_type": unit_type,
                 "requested_amount_base": target_amount_base,
                 "delivered_amount_base": qty * pkg_g,
-                "line_total_eur": round(qty * 0.89, 2),
+                "line_total_eur": round(qty * 0.79, 2),
                 "product": {
-                    "article_id": 28242,
+                    "article_id": 28435,
                     "name": "K-Classic Naturjoghurt 1,5%",
-                    "description": "4 x 150g",
-                    "package_weight_g": 600.0,
-                    "price_eur": 0.89,
-                    "price_per_kg_eur": 1.48,
+                    "description": "500g",
+                    "package_weight_g": 500.0,
+                    "price_eur": 0.79,
+                    "price_per_kg_eur": 1.58,
                 },
             }
         if "puten schnitzel" in ql:
@@ -1023,8 +1073,8 @@ class TestFlaschenpostHelpers(unittest.TestCase):
                 p["articleId"]: p["quantityTotal"]
                 for p in fake_client.cart_positions_calls[0]
             }
-            # 1kg + 500g = 1500g Naturjoghurt -> ceil(1500 / 600) = 3 packs (1.8kg)
-            self.assertEqual(pos_by_aid[28242], 3)
+            # 1kg + 500g = 1500g Naturjoghurt -> ceil(1500 / 500) = 3 packs (1.5kg) via total price #28435
+            self.assertEqual(pos_by_aid[28435], 3)
             # 1,5kg Puten Schnitzel -> ceil(1500 / 500) = 3 packs (1.5kg)
             self.assertEqual(pos_by_aid[29997], 3)
             # 1 Kiste Pepsi Zero -> 1 crate
@@ -1037,6 +1087,88 @@ class TestFlaschenpostHelpers(unittest.TestCase):
 
         asyncio.run(_run())
 
+
+
+    def test_total_price_winner_and_sort_switching(self) -> None:
+            """Verify #28435 (1.58 EUR total) wins over #28249 (1.78 EUR total) for 1kg yogurt by default."""
+            async def _run() -> None:
+                fake_client = _FakeApiClient()
+                mgr = FlaschenpostShoppingListManager(client=fake_client)  # type: ignore[arg-type]
+
+                # Default (total price): #28435 should win
+                preview_default = await mgr.async_preview_search(
+                    "Naturjoghurt",
+                    amount_prefix="1kg",
+                    category="Joghurt & Skyr > Naturjoghurt",
+                )
+                self.assertIsNotNone(preview_default["winner"])
+                self.assertEqual(preview_default["winner"]["article_id"], 28435)
+                self.assertEqual(preview_default["winner"]["line_total_eur"], 1.58)
+                # In candidate table, #28435 is first because 1.58 EUR < 1.78 EUR
+                self.assertEqual(preview_default["candidates"][0]["article_id"], 28435)
+                self.assertEqual(preview_default["candidates"][1]["article_id"], 28249)
+                self.assertIn("1.58 EUR", preview_default["markdown"])
+
+                # Sort by €/kg: #28249 should win (1.48 EUR/kg vs 1.58 EUR/kg)
+                preview_kg = await mgr.async_preview_search(
+                    "Naturjoghurt",
+                    amount_prefix="1kg",
+                    category="Joghurt & Skyr > Naturjoghurt",
+                    sort_by=SORT_PRICE_PER_KG,
+                )
+                self.assertIsNotNone(preview_kg["winner"])
+                self.assertEqual(preview_kg["winner"]["article_id"], 28249)
+                self.assertEqual(preview_kg["winner"]["line_total_eur"], 1.78)
+                self.assertEqual(preview_kg["candidates"][0]["article_id"], 28249)
+
+                # Test real FlaschenpostApiClient resolution logic with mock products
+                real_client = FlaschenpostApiClient(email="test@example.com", password="pass")
+                cands = [
+                    {
+                        "article_id": 28249,
+                        "name": "K-Classic Naturjoghurt 3,5%",
+                        "description": "4 x 150g",
+                        "package_weight_g": 600.0,
+                        "price_eur": 0.89,
+                        "price_per_kg_eur": 1.48,
+                        "is_available": True,
+                    },
+                    {
+                        "article_id": 28435,
+                        "name": "K-Classic Naturjoghurt 1,5%",
+                        "description": "500g",
+                        "package_weight_g": 500.0,
+                        "price_eur": 0.79,
+                        "price_per_kg_eur": 1.58,
+                        "is_available": True,
+                    },
+                ]
+                async def _fake_search(*args, **kwargs):
+                    return list(cands)
+                real_client.async_search_products = _fake_search  # type: ignore[assignment]
+
+                # Default (None / SORT_PRICE): #28435 wins
+                res_default = await real_client.async_resolve_item_for_cart(
+                    "Naturjoghurt",
+                    unit_type=UNIT_TYPE_WEIGHT_G,
+                    target_amount_base=1000.0,
+                )
+                self.assertIsNotNone(res_default)
+                self.assertEqual(res_default["article_id"], 28435)
+                self.assertEqual(res_default["line_total_eur"], 1.58)
+
+                # Explicit SORT_PRICE_PER_KG: #28249 wins
+                res_kg = await real_client.async_resolve_item_for_cart(
+                    "Naturjoghurt",
+                    unit_type=UNIT_TYPE_WEIGHT_G,
+                    target_amount_base=1000.0,
+                    sort_by=SORT_PRICE_PER_KG,
+                )
+                self.assertIsNotNone(res_kg)
+                self.assertEqual(res_kg["article_id"], 28249)
+                self.assertEqual(res_kg["line_total_eur"], 1.78)
+
+            asyncio.run(_run())
 
 if __name__ == "__main__":
     unittest.main()
