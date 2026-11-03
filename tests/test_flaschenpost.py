@@ -15,6 +15,40 @@ from typing import Any
 # importing `custom_components/flaschenpost/__init__.py` (which requires full HA).
 _ROOT = Path(__file__).resolve().parents[1]
 _PKG_DIR = _ROOT / "custom_components" / "flaschenpost"
+
+if "voluptuous" not in sys.modules:
+    vol = types.ModuleType("voluptuous")
+    vol.Required = lambda k, **kw: k
+    vol.Optional = lambda k, **kw: k
+    vol.Any = lambda *args: None
+    vol.All = lambda *args: None
+    vol.Coerce = lambda t: t
+    vol.Range = lambda **kw: None
+    sys.modules["voluptuous"] = vol
+
+if "homeassistant" not in sys.modules:
+    ha = types.ModuleType("homeassistant")
+    ha_core = types.ModuleType("homeassistant.core")
+    ha_core.HomeAssistant = object
+    ha_comp = types.ModuleType("homeassistant.components")
+    ha_ws = types.ModuleType("homeassistant.components.websocket_api")
+
+    def _ws_cmd(schema: Any) -> Any:
+        def dec(fn: Any) -> Any:
+            fn._ws_schema = schema
+            return fn
+        return dec
+
+    ha_ws.websocket_command = _ws_cmd
+    ha_ws.async_response = lambda fn: fn
+    ha_ws.ActiveConnection = object
+    ha_ws.async_register_command = lambda hass, cmd: None
+    ha_comp.websocket_api = ha_ws
+    sys.modules["homeassistant"] = ha
+    sys.modules["homeassistant.core"] = ha_core
+    sys.modules["homeassistant.components"] = ha_comp
+    sys.modules["homeassistant.components.websocket_api"] = ha_ws
+
 if "custom_components.flaschenpost" not in sys.modules:
     cc_pkg = types.ModuleType("custom_components")
     cc_pkg.__path__ = [str(_ROOT / "custom_components")]
@@ -22,7 +56,7 @@ if "custom_components.flaschenpost" not in sys.modules:
     fp_pkg.__path__ = [str(_PKG_DIR)]
     sys.modules.setdefault("custom_components", cc_pkg)
     sys.modules["custom_components.flaschenpost"] = fp_pkg
-    for mod_name in ("const", "api", "shopping_list"):
+    for mod_name in ("const", "api", "shopping_list", "websocket_api"):
         spec = importlib.util.spec_from_file_location(
             f"custom_components.flaschenpost.{mod_name}",
             _PKG_DIR / f"{mod_name}.py",
@@ -68,6 +102,21 @@ from custom_components.flaschenpost.shopping_list import (
     parse_shopping_item_details,
     parse_shopping_item_spec,
     parse_shopping_item_summary,
+)
+from custom_components.flaschenpost.websocket_api import (
+    async_register_websocket_commands,
+    ws_add_item,
+    ws_buy_cart,
+    ws_delete_item,
+    ws_delete_list,
+    ws_get_cart,
+    ws_get_categories,
+    ws_get_lists,
+    ws_preview_lists,
+    ws_preview_search,
+    ws_save_list,
+    ws_sync_to_cart,
+    ws_update_item,
 )
 
 
@@ -421,7 +470,23 @@ class _FakeApiClient:
         return None
 
     async def async_get_cart(self) -> dict[str, Any]:
-        return {"id": "cart-123", "lineItems": []}
+        return {
+            "id": "cart-123",
+            "totalPrice": {"centAmount": 2850},
+            "shippingInfo": {"price": {"centAmount": 0}},
+            "custom": {"fields": {"MinimumOrderValue": 2500}},
+            "lineItems": [
+                {
+                    "variant": {"sku": "32672"},
+                    "product": {"name": {"de": "K-Classic Heidelbeeren"}},
+                    "quantity": 1,
+                    "price": {"value": {"centAmount": 489}},
+                }
+            ],
+        }
+
+    async def async_place_order(self, **kwargs: Any) -> dict[str, Any]:
+        return {"id": "ord-mock-123", "orderNumber": "10042"}
 
     async def async_create_new_cart(self) -> dict[str, Any]:
         self.cleared_cart = True
@@ -1385,6 +1450,224 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             add_res = await mgr.async_add_lists_to_cart()
             self.assertEqual(add_res["synced_count"], 1)
             self.assertEqual(add_res["resolved_items"][0]["article_id"], 32672)
+
+        asyncio.run(_run())
+
+
+    def test_websocket_api_endpoints_and_panel_registration(self) -> None:
+        """Verify all WebSocket API commands for the interactive shopping list panel."""
+        class _MockActiveConn:
+            def __init__(self) -> None:
+                self.results: dict[int, Any] = {}
+                self.errors: dict[int, tuple[str, str]] = {}
+
+            def send_result(self, msg_id: int, result: Any = None) -> None:
+                self.results[msg_id] = result
+
+            def send_error(self, msg_id: int, code: str, message: str) -> None:
+                self.errors[msg_id] = (code, message)
+
+        class _MockEntry:
+            options: dict[str, Any] = {}
+            data: dict[str, Any] = {"default_payment_method": "credit_card"}
+
+        class _MockCoordinator:
+            def __init__(self, fake_client: _FakeApiClient, mgr: FlaschenpostShoppingListManager) -> None:
+                self.client = fake_client
+                self.shopping_list = mgr
+                self.config_entry = _MockEntry()
+                self.updated_listeners = False
+                self.refreshed = False
+
+            def async_update_listeners(self) -> None:
+                self.updated_listeners = True
+
+            async def async_request_refresh(self) -> None:
+                self.refreshed = True
+
+        async def _run() -> None:
+            fake_client = _FakeApiClient()
+            mgr = FlaschenpostShoppingListManager(client=fake_client)  # type: ignore[arg-type]
+            coord = _MockCoordinator(fake_client, mgr)
+
+            mock_hass = types.SimpleNamespace()
+            mock_hass.data = {"flaschenpost": {"mock_entry": coord}}
+            registered_cmds: list[Any] = []
+            sys.modules["homeassistant.components.websocket_api"].async_register_command = (  # type: ignore[attr-defined]
+                lambda hass, cmd: registered_cmds.append(cmd)
+            )
+
+            # Test command registration
+            async_register_websocket_commands(mock_hass)  # type: ignore[arg-type]
+            self.assertEqual(len(registered_cmds), 12)
+
+            conn = _MockActiveConn()
+
+            # 1. ws_get_lists
+            await ws_get_lists(mock_hass, conn, {"id": 1, "type": "flaschenpost/get_lists"})  # type: ignore[arg-type]
+            self.assertIn(1, conn.results)
+            self.assertTrue(any("Shopping list" in n or "Einkaufsliste" in n for n in conn.results[1]["names"]))
+
+            # 2. ws_save_list
+            await ws_save_list(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 2,
+                    "type": "flaschenpost/save_list",
+                    "name": "Wocheneinkauf",
+                    "items": ["500g Heidelbeeren !zucker", "1 Kiste Pepsi Zero"],
+                },
+            )
+            self.assertIn(2, conn.results)
+            self.assertEqual(conn.results[2]["name"], "Wocheneinkauf")
+            self.assertEqual(conn.results[2]["item_count"], 2)
+            self.assertIn("Wocheneinkauf", conn.results[2]["names"])
+
+            # 3. ws_add_item
+            await ws_add_item(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 3,
+                    "type": "flaschenpost/add_item",
+                    "list_name": "Wocheneinkauf",
+                    "summary": "1kg Naturjoghurt [€/kg]",
+                },
+            )
+            self.assertIn(3, conn.results)
+            self.assertEqual(conn.results[3]["item"]["query"], "Naturjoghurt")
+
+            # 4. ws_update_item
+            item_uid = conn.results[3]["item"]["uid"]
+            await ws_update_item(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 4,
+                    "type": "flaschenpost/update_item",
+                    "list_name": "Wocheneinkauf",
+                    "uid": item_uid,
+                    "completed": True,
+                },
+            )
+            self.assertIn(4, conn.results)
+            self.assertTrue(conn.results[4]["item"]["completed"])
+
+            # 5. ws_delete_item
+            await ws_delete_item(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 5,
+                    "type": "flaschenpost/delete_item",
+                    "list_name": "Wocheneinkauf",
+                    "uids": [item_uid],
+                },
+            )
+            self.assertIn(5, conn.results)
+            self.assertEqual(conn.results[5]["deleted_uids"], [item_uid])
+
+            # 6. ws_preview_search with negative keywords
+            await ws_preview_search(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 6,
+                    "type": "flaschenpost/preview_search",
+                    "query": "Heidelbeeren !zucker",
+                },
+            )
+            self.assertIn(6, conn.results)
+            res_preview = conn.results[6]
+            self.assertIsNotNone(res_preview["winner"])
+            self.assertEqual(res_preview["winner"]["article_id"], 32672)
+            cand_aids = [c["article_id"] for c in res_preview["candidates"]]
+            self.assertIn(32672, cand_aids)
+            self.assertNotIn(29010, cand_aids)
+
+            # 7. ws_preview_lists (dry run)
+            await ws_preview_lists(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 7,
+                    "type": "flaschenpost/preview_lists",
+                    "shopping_lists": ["Wocheneinkauf"],
+                },
+            )
+            self.assertIn(7, conn.results)
+            self.assertIn("estimated_goods_eur", conn.results[7])
+
+            # 8. ws_get_categories
+            await ws_get_categories(mock_hass, conn, {"id": 8, "type": "flaschenpost/get_categories"})  # type: ignore[arg-type]
+            self.assertIn(8, conn.results)
+            self.assertIsInstance(conn.results[8]["options"], list)
+
+            # 9. ws_get_cart
+            await ws_get_cart(mock_hass, conn, {"id": 9, "type": "flaschenpost/get_cart"})  # type: ignore[arg-type]
+            self.assertIn(9, conn.results)
+            self.assertIn("min_order_value_eur", conn.results[9])
+
+            # 10. ws_sync_to_cart
+            await ws_sync_to_cart(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 10,
+                    "type": "flaschenpost/sync_to_cart",
+                    "shopping_lists": ["Wocheneinkauf"],
+                },
+            )
+            self.assertIn(10, conn.results)
+            self.assertTrue(coord.refreshed)
+
+            # 11. ws_buy_cart: unconfirmed error
+            await ws_buy_cart(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 11,
+                    "type": "flaschenpost/buy_cart",
+                    "confirm": False,
+                },
+            )
+            self.assertIn(11, conn.errors)
+            self.assertEqual(conn.errors[11][0], "unconfirmed")
+
+            # 12. ws_buy_cart: confirmed
+            await ws_buy_cart(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 12,
+                    "type": "flaschenpost/buy_cart",
+                    "confirm": True,
+                },
+            )
+            self.assertIn(12, conn.results)
+            self.assertEqual(conn.results[12]["order_id"], "ord-mock-123")
+
+            # 13. ws_delete_list
+            await ws_delete_list(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 13,
+                    "type": "flaschenpost/delete_list",
+                    "name": "Wocheneinkauf",
+                },
+            )
+            self.assertIn(13, conn.results)
+            self.assertTrue(conn.results[13]["deleted"])
+
+            # 14. Verify frontend panel JS asset exists and contains web component
+            panel_js_file = _PKG_DIR / "frontend" / "flaschenpost-panel.js"
+            self.assertTrue(panel_js_file.exists())
+            js_content = panel_js_file.read_text(encoding="utf-8")
+            self.assertIn("flaschenpost-panel", js_content)
+            self.assertIn("flaschenpost-card", js_content)
+            self.assertIn("flaschenpost-view", js_content)
 
         asyncio.run(_run())
 

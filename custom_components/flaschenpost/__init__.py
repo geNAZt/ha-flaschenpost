@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import voluptuous as vol
@@ -57,6 +58,7 @@ from .shopping_list import (
     parse_shopping_item_spec,
     resolve_sort_alias,
 )
+from .websocket_api import async_register_websocket_commands
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -183,6 +185,71 @@ async def _async_fetch_external_ha_todo_items(
     return external
 
 
+PANEL_URL_PATH = "flaschenpost"
+FRONTEND_URL = "/flaschenpost_static"
+
+
+async def _async_register_frontend_panel(hass: HomeAssistant) -> None:
+    """Register Flaschenpost sidebar panel and Lovelace card resource."""
+    frontend_dir = Path(__file__).parent / "frontend"
+
+    # 1. Register static path for frontend assets
+    if hasattr(hass.http, "async_register_static_paths"):
+        try:
+            from homeassistant.components.http import StaticPathConfig
+
+            await hass.http.async_register_static_paths(
+                [StaticPathConfig(FRONTEND_URL, str(frontend_dir), cache_headers=False)]
+            )
+        except Exception as err:
+            _LOGGER.debug("Could not use async_register_static_paths: %s", err)
+    elif hasattr(hass.http, "register_static_path"):
+        try:
+            hass.http.register_static_path(
+                FRONTEND_URL, str(frontend_dir), cache_headers=False
+            )
+        except Exception as err:
+            _LOGGER.debug("Could not use register_static_path: %s", err)
+
+    # 2. Register extra JS url for Lovelace Card picker
+    try:
+        from homeassistant.components import frontend
+
+        if hasattr(frontend, "add_extra_js_url"):
+            frontend.add_extra_js_url(hass, f"{FRONTEND_URL}/flaschenpost-panel.js")
+    except Exception as err:
+        _LOGGER.debug("Could not register extra js url: %s", err)
+
+    # 3. Register custom sidebar panel
+    try:
+        from homeassistant.components import panel_custom
+
+        current_panels = hass.data.get("frontend_panels", {})
+        if PANEL_URL_PATH not in current_panels:
+            await panel_custom.async_register_panel(
+                hass=hass,
+                frontend_url_path=PANEL_URL_PATH,
+                webcomponent_name="flaschenpost-panel",
+                sidebar_title="Flaschenpost",
+                sidebar_icon="mdi:cart-outline",
+                module_url=f"{FRONTEND_URL}/flaschenpost-panel.js",
+                require_admin=False,
+            )
+    except Exception as err:
+        _LOGGER.debug("Could not register Flaschenpost sidebar panel: %s", err)
+
+
+def _async_unregister_frontend_panel(hass: HomeAssistant) -> None:
+    """Unregister Flaschenpost sidebar panel."""
+    try:
+        from homeassistant.components import frontend
+
+        if hasattr(frontend, "async_remove_panel"):
+            frontend.async_remove_panel(hass, PANEL_URL_PATH)
+    except Exception as err:
+        _LOGGER.debug("Could not remove sidebar panel: %s", err)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Flaschenpost from a config entry."""
     hass.data.setdefault(DOMAIN, {})
@@ -219,6 +286,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _async_register_services(hass)
+    async_register_websocket_commands(hass)
+    await _async_register_frontend_panel(hass)
     return True
 
 
@@ -231,6 +300,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not hass.data[DOMAIN]:
             for svc in ALL_SERVICES:
                 hass.services.async_remove(DOMAIN, svc)
+            _async_unregister_frontend_panel(hass)
     return unload_ok
 
 
