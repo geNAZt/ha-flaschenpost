@@ -836,11 +836,7 @@ class FlaschenpostShoppingListManager:
                 sname = str(sub.get("name") or "").strip()
                 if not sname:
                     continue
-                val = (
-                    f"{tname}::{sname}"
-                    if sub_counts.get(sname.lower(), 0) > 1
-                    else sname
-                )
+                val = f"{tname}::{sname}"
                 if val not in seen_values:
                     seen_values.add(val)
                     options.append({"value": val, "label": f"{tname} -> {sname}"})

@@ -677,6 +677,44 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             matches_category_filter(dairy_summary, "Pudding, Grieß & Milchreis")
         )
 
+        herta_summary = {
+            "name": "Herta Finesse Putenbrust gegrillt",
+            "categories": [
+                "Fleisch & Fisch",
+                "Wurst & Aufschnitt",
+                "Geflügelaufschnitt",
+            ],
+            "category_slugs": [
+                "fleisch-fisch",
+                "wurst-aufschnitt",
+                "gefluegelaufschnitt",
+            ],
+        }
+        meat_summary = {
+            "name": "K-Purland Puten Hackfleisch",
+            "categories": ["Fleisch & Fisch", "Fleisch"],
+            "category_slugs": ["fleisch-fisch", "fleisch"],
+        }
+        # Filter "Fleisch & Fisch -> Fleisch" rejects Wurst & Aufschnitt
+        self.assertFalse(
+            matches_category_filter(herta_summary, "Fleisch & Fisch -> Fleisch")
+        )
+        self.assertFalse(
+            matches_category_filter(herta_summary, "Fleisch & Fisch::Fleisch")
+        )
+        self.assertTrue(
+            matches_category_filter(meat_summary, "Fleisch & Fisch -> Fleisch")
+        )
+        self.assertTrue(
+            matches_category_filter(meat_summary, "Fleisch & Fisch::Fleisch")
+        )
+        # Filter "Fleisch" matches pure meat, but rejects Wurst & Aufschnitt
+        self.assertFalse(matches_category_filter(herta_summary, "Fleisch"))
+        self.assertTrue(matches_category_filter(meat_summary, "Fleisch"))
+        # Filter "Fleisch & Fisch" matches both
+        self.assertTrue(matches_category_filter(herta_summary, "Fleisch & Fisch"))
+        self.assertTrue(matches_category_filter(meat_summary, "Fleisch & Fisch"))
+
     def test_search_synonyms_and_qualifiers(self) -> None:
         self.assertIn(
             "Schwip Schwap Zero",

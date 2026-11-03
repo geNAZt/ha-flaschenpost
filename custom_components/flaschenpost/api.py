@@ -53,7 +53,7 @@ _DESC_AMOUNT_REGEX = re.compile(
 _QUERY_FILLER_WORDS = {"fett", "fettgehalt", "i.tr.", "ca."}
 _QUALIFIER_TOKEN_REGEX = re.compile(r"\d+(?:[.,]\d+)?\s*%")
 _DOUBLE_CONSONANT_REGEX = re.compile(r"([bcdfghjklmnpqrstvwxz])\1+")
-_CATEGORY_SPLIT_REGEX = re.compile(r"\s*(?:::|>|/)\s*")
+_CATEGORY_SPLIT_REGEX = re.compile(r"\s*(?:->|-->|::|>|/)\s*")
 
 _SYNONYM_GROUPS: list[tuple[str, ...]] = [
     ("zero", "ohne zucker", "zuckerfrei", "sugarfree"),
@@ -162,13 +162,21 @@ def _normalize_category_token(text: str) -> str:
 
 
 def _category_segment_matches(seg: str, cand: str) -> bool:
-    """Word-boundary category token match so `'reis'` matches `'reis getreide'` but NOT `'milchreis'`."""
+    """Return True if category token `cand` matches filter segment `seg`."""
     if not seg or not cand:
         return False
     if seg == cand:
         return True
     cand_words = cand.split()
-    return all(tok in cand_words for tok in seg.split())
+    seg_words = seg.split()
+    if seg_words == cand_words:
+        return True
+    cand_parts = [
+        _normalize_category_token(p)
+        for p in re.split(r",|\s+(?:und|&|\+)\s+", cand)
+        if _normalize_category_token(p)
+    ]
+    return seg in cand_parts
 
 
 def extract_product_categories(
@@ -222,7 +230,7 @@ def matches_category_filter(item: dict[str, Any], category_filter: str | None) -
     """Return True if candidate's category hierarchy satisfies `category_filter`.
 
     Supports single categories (`'Reis & Getreide'`), slugs (`'reis-getreide'`),
-    and hierarchical paths (`'Kochen & Vorrat::Reis & Getreide'` or `'Kochen & Vorrat > Reis & Getreide'`).
+    and hierarchical paths (`'Fleisch & Fisch -> Fleisch'` or `'Kochen & Vorrat::Reis & Getreide'`).
     """
     if not category_filter or not category_filter.strip():
         return True
@@ -237,18 +245,31 @@ def matches_category_filter(item: dict[str, Any], category_filter: str | None) -
 
     item_cats = item.get("categories") or []
     item_slugs = item.get("category_slugs") or []
-    norm_pool = [
-        _normalize_category_token(str(x))
-        for x in (*item_cats, *item_slugs)
-        if str(x).strip()
-    ]
-    if not norm_pool:
+    if not item_cats and not item_slugs:
         return False
 
-    for seg in segments:
-        if not any(_category_segment_matches(seg, cand) for cand in norm_pool):
-            return False
-    return True
+    if len(segments) > 1:
+        curr_level = 0
+        for seg in segments:
+            matched = False
+            for idx in range(curr_level, max(len(item_cats), len(item_slugs))):
+                cname = _normalize_category_token(str(item_cats[idx])) if idx < len(item_cats) else ""
+                cslug = _normalize_category_token(str(item_slugs[idx])) if idx < len(item_slugs) else ""
+                if _category_segment_matches(seg, cname) or _category_segment_matches(seg, cslug):
+                    curr_level = idx + 1
+                    matched = True
+                    break
+            if not matched:
+                return False
+        return True
+
+    seg = segments[0]
+    for idx in range(max(len(item_cats), len(item_slugs))):
+        cname = _normalize_category_token(str(item_cats[idx])) if idx < len(item_cats) else ""
+        cslug = _normalize_category_token(str(item_slugs[idx])) if idx < len(item_slugs) else ""
+        if _category_segment_matches(seg, cname) or _category_segment_matches(seg, cslug):
+            return True
+    return False
 
 
 def extract_price_tiers(
@@ -1361,24 +1382,35 @@ class FlaschenpostApiClient:
 
         matched_ids: list[str] = []
         for top in tree:
-            top_tokens = [
-                _normalize_category_token(top.get("name") or ""),
-                _normalize_category_token(top.get("slug") or ""),
-            ]
-            for sub in top.get("subcategories") or []:
-                ext_id = sub.get("external_id")
-                if not ext_id:
+            top_name = _normalize_category_token(top.get("name") or "")
+            top_slug = _normalize_category_token(top.get("slug") or "")
+
+            if len(segments) > 1:
+                if not (_category_segment_matches(segments[0], top_name) or _category_segment_matches(segments[0], top_slug)):
                     continue
-                sub_tokens = [
-                    _normalize_category_token(sub.get("name") or ""),
-                    _normalize_category_token(sub.get("slug") or ""),
-                ]
-                hierarchy_pool = [t for t in (*top_tokens, *sub_tokens) if t]
-                if all(
-                    any(_category_segment_matches(seg, cand) for cand in hierarchy_pool)
-                    for seg in segments
-                ):
-                    matched_ids.append(str(ext_id))
+                for sub in top.get("subcategories") or []:
+                    ext_id = sub.get("external_id")
+                    if not ext_id:
+                        continue
+                    sub_name = _normalize_category_token(sub.get("name") or "")
+                    sub_slug = _normalize_category_token(sub.get("slug") or "")
+                    if _category_segment_matches(segments[1], sub_name) or _category_segment_matches(segments[1], sub_slug):
+                        matched_ids.append(str(ext_id))
+            else:
+                seg = segments[0]
+                if _category_segment_matches(seg, top_name) or _category_segment_matches(seg, top_slug):
+                    for sub in top.get("subcategories") or []:
+                        if sub.get("external_id"):
+                            matched_ids.append(str(sub["external_id"]))
+                else:
+                    for sub in top.get("subcategories") or []:
+                        ext_id = sub.get("external_id")
+                        if not ext_id:
+                            continue
+                        sub_name = _normalize_category_token(sub.get("name") or "")
+                        sub_slug = _normalize_category_token(sub.get("slug") or "")
+                        if _category_segment_matches(seg, sub_name) or _category_segment_matches(seg, sub_slug):
+                            matched_ids.append(str(ext_id))
         return matched_ids
 
     async def async_search_products(
