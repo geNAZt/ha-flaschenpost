@@ -113,13 +113,13 @@ class FlaschenpostView extends HTMLElement {
     }
   }
 
-  _triggerSearchDebounced() {
+  _triggerSearchDebounced(delay = 1000) {
     if (this._searchDebounceTimer) {
       clearTimeout(this._searchDebounceTimer);
     }
     this._searchDebounceTimer = setTimeout(() => {
       this._executeSearch();
-    }, 280);
+    }, delay);
   }
 
   _buildCurrentQueryString() {
@@ -1672,7 +1672,7 @@ class FlaschenpostView extends HTMLElement {
     if (searchInput) {
       searchInput.addEventListener("input", (e) => {
         this._query = e.target.value;
-        this._triggerSearchDebounced();
+        this._triggerSearchDebounced(1000);
       });
       searchInput.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
@@ -1686,7 +1686,7 @@ class FlaschenpostView extends HTMLElement {
     if (amountInput) {
       amountInput.addEventListener("input", (e) => {
         this._amount = parseFloat(e.target.value) || 1;
-        this._triggerSearchDebounced();
+        this._triggerSearchDebounced(1000);
       });
     }
 
@@ -1694,7 +1694,7 @@ class FlaschenpostView extends HTMLElement {
     if (unitSelect) {
       unitSelect.addEventListener("change", (e) => {
         this._unit = e.target.value;
-        this._triggerSearchDebounced();
+        this._triggerSearchDebounced(250);
       });
     }
 
@@ -1702,7 +1702,7 @@ class FlaschenpostView extends HTMLElement {
     if (sortSelect) {
       sortSelect.addEventListener("change", (e) => {
         this._sort = e.target.value;
-        this._triggerSearchDebounced();
+        this._triggerSearchDebounced(250);
       });
     }
 
@@ -1710,7 +1710,7 @@ class FlaschenpostView extends HTMLElement {
     if (catSelect) {
       catSelect.addEventListener("change", (e) => {
         this._category = e.target.value;
-        this._triggerSearchDebounced();
+        this._triggerSearchDebounced(250);
       });
     }
 
