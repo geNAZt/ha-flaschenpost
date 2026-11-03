@@ -137,12 +137,12 @@ class FlaschenpostView extends HTMLElement {
     if (!queryWithKws || !this._hass) {
       this._preview = null;
       this._isSearching = false;
-      this.render();
+      this._updatePreview();
       return;
     }
 
     this._isSearching = true;
-    this.render();
+    this._updatePreview();
 
     try {
       let amountPrefix = null;
@@ -165,7 +165,7 @@ class FlaschenpostView extends HTMLElement {
       this._preview = null;
     } finally {
       this._isSearching = false;
-      this.render();
+      this._updatePreview();
     }
   }
 
@@ -179,6 +179,7 @@ class FlaschenpostView extends HTMLElement {
       // Remove from positive if present
       this._positiveKeywords = this._positiveKeywords.filter((k) => k.toLowerCase() !== clean.toLowerCase());
     }
+    this._updateChips();
     this._triggerSearchDebounced();
   }
 
@@ -192,6 +193,7 @@ class FlaschenpostView extends HTMLElement {
       // Remove from negative if present
       this._negativeKeywords = this._negativeKeywords.filter((k) => k.toLowerCase() !== clean.toLowerCase());
     }
+    this._updateChips();
     this._triggerSearchDebounced();
   }
 
@@ -209,6 +211,7 @@ class FlaschenpostView extends HTMLElement {
         this._negativeKeywords = this._negativeKeywords.filter((k) => k.toLowerCase() !== clean.toLowerCase());
       }
     }
+    this._updateChips();
     this._triggerSearchDebounced();
   }
 
@@ -316,8 +319,8 @@ class FlaschenpostView extends HTMLElement {
       this._unit = "x";
     }
 
-    this._triggerSearchDebounced();
     this.render();
+    this._triggerSearchDebounced();
     this.shadowRoot.getElementById("search-input")?.focus();
   }
 
@@ -423,22 +426,229 @@ class FlaschenpostView extends HTMLElement {
 
   _showToast(msg, isError = false) {
     this._actionMessage = { text: msg, isError };
-    this.render();
+    const container = this.shadowRoot ? this.shadowRoot.getElementById("toast-container") : null;
+    if (container) {
+      container.innerHTML = `<div class="toast ${isError ? "error" : "success"}">${msg}</div>`;
+    }
     setTimeout(() => {
       if (this._actionMessage && this._actionMessage.text === msg) {
         this._actionMessage = null;
-        this.render();
+        if (container) {
+          container.innerHTML = "";
+        }
       }
     }, 4000);
   }
 
+  _renderNegativeChipsHtml() {
+    const commonNegatives = ["zucker", "bio", "alkoholfrei", "laktose", "weizen", "gezuckert"];
+    return `
+      ${this._negativeKeywords
+        .map(
+          (kw) => `
+        <span class="chip chip-neg-active" data-neg-toggle="${kw}">
+          🚫 !${kw} <span class="chip-close">×</span>
+        </span>
+      `
+        )
+        .join("")}
+      ${commonNegatives
+        .filter((ck) => !this._negativeKeywords.some((k) => k.toLowerCase() === ck.toLowerCase()))
+        .map(
+          (ck) => `
+        <span class="chip chip-neg-avail" data-neg-toggle="${ck}">
+          + !${ck}
+        </span>
+      `
+        )
+        .join("")}
+    `;
+  }
+
+  _renderPositiveChipsHtml() {
+    const commonPositives = ["bio", "vegan", "zero", "light", "3,5%", "1,5%"];
+    return `
+      ${this._positiveKeywords
+        .map(
+          (kw) => `
+        <span class="chip chip-pos-active" data-pos-toggle="${kw}">
+          ✓ ${kw} <span class="chip-close">×</span>
+        </span>
+      `
+        )
+        .join("")}
+      ${commonPositives
+        .filter((cp) => !this._positiveKeywords.some((k) => k.toLowerCase() === cp.toLowerCase()))
+        .map(
+          (cp) => `
+        <span class="chip chip-pos-avail" data-pos-toggle="${cp}">
+          + ${cp}
+        </span>
+      `
+        )
+        .join("")}
+    `;
+  }
+
+  _bindChipsEvents() {
+    const root = this.shadowRoot;
+    if (!root) return;
+
+    root.querySelectorAll("#chips-neg-container [data-neg-toggle]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._toggleNegativeKeyword(el.dataset.negToggle);
+      });
+    });
+
+    root.querySelectorAll("#chips-pos-container [data-pos-toggle]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._togglePositiveKeyword(el.dataset.posToggle);
+      });
+    });
+  }
+
+  _updateChips() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const negContainer = root.getElementById("chips-neg-container");
+    if (negContainer) {
+      negContainer.innerHTML = this._renderNegativeChipsHtml();
+    }
+    const posContainer = root.getElementById("chips-pos-container");
+    if (posContainer) {
+      posContainer.innerHTML = this._renderPositiveChipsHtml();
+    }
+    this._bindChipsEvents();
+  }
+
+  _renderPreviewContent() {
+    const queryWithKws = this._buildCurrentQueryString();
+    if (!this._query || !this._query.trim()) {
+      return "";
+    }
+
+    let winnerHtml = "";
+    if (this._preview && this._preview.winner && this._preview.winner.product) {
+      const w = this._preview.winner;
+      const priceMetric = w.product.price_per_kg_eur
+        ? `${Number(w.product.price_per_kg_eur).toFixed(2)} €/kg`
+        : `${Number(w.product.price_eur || 0).toFixed(2)} €`;
+
+      winnerHtml = `
+        <div class="winner-banner">
+          <div class="winner-badge">★ Order-Time Winner</div>
+          <div style="font-weight: 700; font-size: 1.05rem;">
+            ${w.quantity}x ${w.product.name} (#${w.article_id})
+          </div>
+          <div style="font-size: 0.88rem; color: #555;">
+            Geliefert: <strong>${w.delivered_amount_base || ""}</strong> für <strong>${(w.line_total_eur || 0).toFixed(2)} €</strong>
+            (${priceMetric})
+          </div>
+        </div>
+      `;
+    } else if (this._isSearching) {
+      winnerHtml = `<div style="padding: 12px; color: #666;">Warehouse-Katalog wird durchsucht...</div>`;
+    } else {
+      winnerHtml = `<div style="padding: 12px; color: #d32f2f;">Kein lieferbares Produkt passt zu diesen Suchbegriffen & Filtern.</div>`;
+    }
+
+    let candidatesHtml = "";
+    if (this._preview && this._preview.candidates && this._preview.candidates.length > 0) {
+      candidatesHtml = `
+        <div style="overflow-x: auto;">
+          <table class="candidate-table">
+            <thead>
+              <tr>
+                <th>#SKU</th>
+                <th>Produkt</th>
+                <th>Packung</th>
+                <th>Grundpreis</th>
+                <th>Bedarf -> Summe</th>
+                <th>Status</th>
+                <th>Aktionen</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${this._preview.candidates
+                .map((c) => {
+                  const isWinner = this._preview.winner && this._preview.winner.article_id === c.article_id;
+                  return `
+                  <tr>
+                    <td><code>#${c.article_id}</code></td>
+                    <td>
+                      <strong>${c.name}</strong><br />
+                      <span style="font-size:0.75rem; color:#888;">${(c.categories || []).slice(0, 2).join(" > ")}</span>
+                    </td>
+                    <td>${c.description || "1x"} (${Number(c.price_eur || 0).toFixed(2)} €)</td>
+                    <td><strong>${c.base_metric || "-"}</strong></td>
+                    <td>${c.packs}x (${c.delivered_amount}) = <strong>${Number(c.line_total_eur || 0).toFixed(2)} €</strong></td>
+                    <td>
+                      ${
+                        isWinner
+                          ? `<span class="badge-winner">Winner</span>`
+                          : c.is_available
+                          ? `<span class="badge-instock">Lagernd</span>`
+                          : `<span class="badge-nostock">Ausverkauft</span>`
+                      }
+                    </td>
+                    <td>
+                      <div style="display:flex; flex-direction:column; gap:4px;">
+                        <button class="btn-outline btn-pin-sku" data-sku-summary="${c.pinned_summary}" style="font-size:0.75rem; padding:4px 8px;" title="Genau diese SKU pinnen">
+                          📌 SKU #${c.article_id}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                `;
+                })
+                .join("")}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="panel-card">
+        <div class="card-title">
+          <span>Warehouse Live Preview für: <em>${queryWithKws}</em></span>
+          ${this._isSearching ? `<span style="font-size:0.8rem; color:#888;">Suche läuft...</span>` : ""}
+        </div>
+        ${winnerHtml}
+        ${candidatesHtml}
+      </div>
+    `;
+  }
+
+  _bindPreviewEvents() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    root.querySelectorAll("#preview-container .btn-pin-sku[data-sku-summary]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this._addItemToList(btn.dataset.skuSummary);
+      });
+    });
+  }
+
+  _updatePreview() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const container = root.getElementById("preview-container");
+    if (!container) return;
+    container.innerHTML = this._renderPreviewContent();
+    this._bindPreviewEvents();
+  }
+
   render() {
+    // Preserve focused element and text selection
+    const activeEl = this.shadowRoot ? this.shadowRoot.activeElement : null;
+    const activeId = activeEl ? activeEl.id : null;
+    const selStart = (activeEl && typeof activeEl.selectionStart === "number") ? activeEl.selectionStart : null;
+    const selEnd = (activeEl && typeof activeEl.selectionEnd === "number") ? activeEl.selectionEnd : null;
+
     const listItems = (this._lists && this._lists[this._activeList]) || [];
     const openItems = listItems.filter((it) => !it.completed);
     const completedItems = listItems.filter((it) => it.completed);
-
-    const commonNegatives = ["zucker", "bio", "alkoholfrei", "laktose", "weizen", "gezuckert"];
-    const commonPositives = ["bio", "vegan", "zero", "light", "3,5%", "1,5%"];
 
     const cartTotal = this._cart ? this._cart.total_eur : 0;
     const minOrder = this._cart ? this._cart.min_order_value_eur : 25.0;
@@ -857,12 +1067,14 @@ class FlaschenpostView extends HTMLElement {
         }
       </style>
 
-      <!-- Toast message -->
-      ${
-        this._actionMessage
-          ? `<div class="toast ${this._actionMessage.isError ? "error" : "success"}">${this._actionMessage.text}</div>`
-          : ""
-      }
+      <!-- Toast container -->
+      <div id="toast-container">
+        ${
+          this._actionMessage
+            ? `<div class="toast ${this._actionMessage.isError ? "error" : "success"}">${this._actionMessage.text}</div>`
+            : ""
+        }
+      </div>
 
       <!-- Top Header & Cart summary -->
       <div class="header-bar">
@@ -980,52 +1192,16 @@ class FlaschenpostView extends HTMLElement {
           <!-- Negative Keywords Builder Section -->
           <div class="form-group" style="margin-top: 14px;">
             <label style="color: #c62828;">🚫 Negative Keywords (Ausschließen mit !)</label>
-            <div class="chips-container">
-              ${this._negativeKeywords
-                .map(
-                  (kw) => `
-                <span class="chip chip-neg-active" data-neg-toggle="${kw}">
-                  🚫 !${kw} <span class="chip-close">×</span>
-                </span>
-              `
-                )
-                .join("")}
-              ${commonNegatives
-                .filter((ck) => !this._negativeKeywords.some((k) => k.toLowerCase() === ck.toLowerCase()))
-                .map(
-                  (ck) => `
-                <span class="chip chip-neg-avail" data-neg-toggle="${ck}">
-                  + !${ck}
-                </span>
-              `
-                )
-                .join("")}
+            <div id="chips-neg-container" class="chips-container">
+              ${this._renderNegativeChipsHtml()}
             </div>
           </div>
 
           <!-- Positive Keywords Builder Section -->
           <div class="form-group">
             <label style="color: #2e7d32;">✓ Positive Keywords (Qualifizierer)</label>
-            <div class="chips-container">
-              ${this._positiveKeywords
-                .map(
-                  (kw) => `
-                <span class="chip chip-pos-active" data-pos-toggle="${kw}">
-                  ✓ ${kw} <span class="chip-close">×</span>
-                </span>
-              `
-                )
-                .join("")}
-              ${commonPositives
-                .filter((cp) => !this._positiveKeywords.some((k) => k.toLowerCase() === cp.toLowerCase()))
-                .map(
-                  (cp) => `
-                <span class="chip chip-pos-avail" data-pos-toggle="${cp}">
-                  + ${cp}
-                </span>
-              `
-                )
-                .join("")}
+            <div id="chips-pos-container" class="chips-container">
+              ${this._renderPositiveChipsHtml()}
             </div>
           </div>
 
@@ -1047,96 +1223,9 @@ class FlaschenpostView extends HTMLElement {
         <!-- Right Side: Items in Active List & Live Search Candidates -->
         <div style="display: flex; flex-direction: column; gap: 16px;">
           <!-- Live Preview Search Results Card -->
-          ${
-            this._query && this._query.trim()
-              ? `
-            <div class="panel-card">
-              <div class="card-title">
-                <span>Warehouse Live Preview für: <em>${this._buildCurrentQueryString()}</em></span>
-                ${this._isSearching ? `<span style="font-size:0.8rem; color:#888;">Suche läuft...</span>` : ""}
-              </div>
-
-              ${
-                this._preview && this._preview.winner && this._preview.winner.product
-                  ? `
-                <div class="winner-banner">
-                  <div class="winner-badge">★ Order-Time Winner</div>
-                  <div style="font-weight: 700; font-size: 1.05rem;">
-                    ${this._preview.winner.quantity}x ${this._preview.winner.product.name}
-                    (#${this._preview.winner.article_id})
-                  </div>
-                  <div style="font-size: 0.88rem; color: #555;">
-                    Geliefert: <strong>${this._preview.winner.delivered_amount_base || ""}</strong> für <strong>${(this._preview.winner.line_total_eur || 0).toFixed(2)} €</strong>
-                    (${this._preview.winner.product.price_per_kg_eur ? `${Number(this._preview.winner.product.price_per_kg_eur).toFixed(2)} €/kg` : `${Number(this._preview.winner.product.price_eur || 0).toFixed(2)} €`})
-                  </div>
-                </div>
-              `
-                  : this._isSearching
-                  ? `<div style="padding: 12px; color: #666;">Warehouse-Katalog wird durchsucht...</div>`
-                  : `<div style="padding: 12px; color: #d32f2f;">Kein lieferbares Produkt passt zu diesen Suchbegriffen & Filtern.</div>`
-              }
-
-              <!-- Candidates Table -->
-              ${
-                this._preview && this._preview.candidates && this._preview.candidates.length > 0
-                  ? `
-                <div style="overflow-x: auto;">
-                  <table class="candidate-table">
-                    <thead>
-                      <tr>
-                        <th>#SKU</th>
-                        <th>Produkt</th>
-                        <th>Packung</th>
-                        <th>Grundpreis</th>
-                        <th>Bedarf -> Summe</th>
-                        <th>Status</th>
-                        <th>Aktionen</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      ${this._preview.candidates
-                        .map((c) => {
-                          const isWinner = this._preview.winner && this._preview.winner.article_id === c.article_id;
-                          return `
-                          <tr>
-                            <td><code>#${c.article_id}</code></td>
-                            <td>
-                              <strong>${c.name}</strong><br />
-                              <span style="font-size:0.75rem; color:#888;">${(c.categories || []).slice(0, 2).join(" > ")}</span>
-                            </td>
-                            <td>${c.description || "1x"} (${Number(c.price_eur || 0).toFixed(2)} €)</td>
-                            <td><strong>${c.base_metric || "-"}</strong></td>
-                            <td>${c.packs}x (${c.delivered_amount}) = <strong>${Number(c.line_total_eur || 0).toFixed(2)} €</strong></td>
-                            <td>
-                              ${
-                                isWinner
-                                  ? `<span class="badge-winner">Winner</span>`
-                                  : c.is_available
-                                  ? `<span class="badge-instock">Lagernd</span>`
-                                  : `<span class="badge-nostock">Ausverkauft</span>`
-                              }
-                            </td>
-                            <td>
-                              <div style="display:flex; flex-direction:column; gap:4px;">
-                                <button class="btn-outline btn-pin-sku" data-sku-summary="${c.pinned_summary}" style="font-size:0.75rem; padding:4px 8px;" title="Genau diese SKU pinnen">
-                                  📌 SKU #${c.article_id}
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
-                        `;
-                        })
-                        .join("")}
-                    </tbody>
-                  </table>
-                </div>
-              `
-                  : ""
-              }
-            </div>
-          `
-              : ""
-          }
+          <div id="preview-container">
+            ${this._renderPreviewContent()}
+          </div>
 
           <!-- Active Shopping List Items Card -->
           <div class="panel-card">
@@ -1314,6 +1403,19 @@ class FlaschenpostView extends HTMLElement {
     `;
 
     this._bindEvents();
+
+    // Restore focus and cursor selection if an input had focus
+    if (activeId) {
+      const restoredEl = this.shadowRoot.getElementById(activeId);
+      if (restoredEl) {
+        restoredEl.focus();
+        if (selStart !== null && selEnd !== null && restoredEl.setSelectionRange) {
+          try {
+            restoredEl.setSelectionRange(selStart, selEnd);
+          } catch (_) {}
+        }
+      }
+    }
   }
 
   _bindEvents() {
@@ -1370,19 +1472,8 @@ class FlaschenpostView extends HTMLElement {
       });
     }
 
-    // Toggle negative keywords
-    root.querySelectorAll("[data-neg-toggle]").forEach((el) => {
-      el.addEventListener("click", () => {
-        this._toggleNegativeKeyword(el.dataset.negToggle);
-      });
-    });
-
-    // Toggle positive keywords
-    root.querySelectorAll("[data-pos-toggle]").forEach((el) => {
-      el.addEventListener("click", () => {
-        this._togglePositiveKeyword(el.dataset.posToggle);
-      });
-    });
+    // Bind chips events
+    this._bindChipsEvents();
 
     // Custom keyword adder
     const customKwInput = root.getElementById("custom-kw-input");
@@ -1471,11 +1562,7 @@ class FlaschenpostView extends HTMLElement {
     });
 
     // Pin SKU buttons in candidate table
-    root.querySelectorAll(".btn-pin-sku[data-sku-summary]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        this._addItemToList(btn.dataset.skuSummary);
-      });
-    });
+    this._bindPreviewEvents();
 
     // Top action buttons
     const btnDryRun = root.getElementById("btn-dryrun-cart");
