@@ -665,7 +665,7 @@ class FlaschenpostView extends HTMLElement {
               ${this._preview.candidates
                 .map((c) => {
                   const isWinner = this._preview.winner && this._preview.winner.article_id === c.article_id;
-                  const candCats = (c.categories || []).slice(0, 2).join(" > ") || "—";
+                  const candCats = (c.categories || []).join(" > ") || "—";
                   return `
                   <tr>
                     <td>

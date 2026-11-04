@@ -925,35 +925,36 @@ class FlaschenpostShoppingListManager:
         await self.async_save()
 
     async def async_get_category_options(self) -> list[dict[str, str]]:
-        """Build `{value, label}` category & subcategory options from the live warehouse catalog."""
+        """Build `{value, label}` category & subcategory options from the live warehouse catalog for limitless category depth."""
         if not hasattr(self._client, "async_get_categories"):
             return []
         tree = await self._client.async_get_categories()
 
-        sub_counts: dict[str, int] = {}
-        for top in tree:
-            for sub in top.get("subcategories") or []:
-                sname = str(sub.get("name") or "").strip()
-                if sname:
-                    sub_counts[sname.lower()] = sub_counts.get(sname.lower(), 0) + 1
-
         options: list[dict[str, str]] = []
         seen_values: set[str] = set()
+
+        def _traverse(node: dict[str, Any], path: list[str]) -> None:
+            name = str(node.get("name") or "").strip()
+            if not name:
+                return
+            cur_path = [*path, name]
+            val = "::".join(cur_path)
+            subs = node.get("subcategories") or []
+
+            if val not in seen_values:
+                seen_values.add(val)
+                if subs:
+                    label = f"{' -> '.join(cur_path)} (All)" if len(cur_path) > 1 else f"{name} (All)"
+                else:
+                    label = " -> ".join(cur_path) if len(cur_path) > 1 else name
+                options.append({"value": val, "label": label})
+
+            for child in subs:
+                _traverse(child, cur_path)
+
         for top in tree:
-            tname = str(top.get("name") or "").strip()
-            if not tname:
-                continue
-            if tname not in seen_values:
-                seen_values.add(tname)
-                options.append({"value": tname, "label": f"{tname} (All)"})
-            for sub in top.get("subcategories") or []:
-                sname = str(sub.get("name") or "").strip()
-                if not sname:
-                    continue
-                val = f"{tname}::{sname}"
-                if val not in seen_values:
-                    seen_values.add(val)
-                    options.append({"value": val, "label": f"{tname} -> {sname}"})
+            _traverse(top, [])
+
         return options
 
 
@@ -1234,7 +1235,7 @@ class FlaschenpostShoppingListManager:
             winner_aid = winner.get("article_id") if winner else None
             for cand in enriched_candidates:
                 aid = cand.get("article_id")
-                cats_txt = " > ".join((cand.get("categories") or [])[:2]) or "—"
+                cats_txt = " > ".join(cand.get("categories") or []) or "—"
                 desc_txt = cand.get("description") or "1x"
                 stock_txt = (
                     "Winner"
@@ -1287,7 +1288,7 @@ class FlaschenpostShoppingListManager:
             )
             md_lines.append("|---|---|---|---|---|---|")
             for item in res["resolved_items"]:
-                cats_short = " > ".join((item.get("categories") or [])[:2]) or "—"
+                cats_short = " > ".join(item.get("categories") or []) or "—"
                 if item.get("price_per_kg_eur") is not None:
                     base_str = f"{float(item['price_per_kg_eur']):.2f} EUR/kg"
                 elif item.get("price_per_liter_eur") is not None:

@@ -195,7 +195,7 @@ async def _async_fetch_external_ha_todo_items(
 
 PANEL_URL_PATH = "flaschenpost"
 FRONTEND_URL = "/flaschenpost_static"
-PANEL_JS_VERSION = "2.0.6"
+PANEL_JS_VERSION = "2.0.7"
 
 
 async def _async_register_frontend_panel(hass: HomeAssistant) -> None:

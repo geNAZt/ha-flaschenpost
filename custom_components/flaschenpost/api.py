@@ -1330,51 +1330,39 @@ class FlaschenpostApiClient:
             f"/php-product-api/v1/category/warehouse/{wh_id}",
             authenticated=False,
         )
-        normalized: list[dict[str, Any]] = []
-        for top in raw if isinstance(raw, list) else []:
-            tname_map = top.get("name") or {}
-            tname = (
-                tname_map.get("de-DE") or next(iter(tname_map.values()), "")
-                if isinstance(tname_map, dict)
-                else str(tname_map)
+
+        def _normalize_category_node(node: dict[str, Any]) -> dict[str, Any]:
+            nname_map = node.get("name") or {}
+            nname = (
+                nname_map.get("de-DE") or next(iter(nname_map.values()), "")
+                if isinstance(nname_map, dict)
+                else str(nname_map or "")
             ).strip()
-            tslug_map = top.get("slug") or {}
-            tslug = (
-                tslug_map.get("de-DE") or next(iter(tslug_map.values()), "")
-                if isinstance(tslug_map, dict)
-                else str(tslug_map)
+            nslug_map = node.get("slug") or {}
+            nslug = (
+                nslug_map.get("de-DE") or next(iter(nslug_map.values()), "")
+                if isinstance(nslug_map, dict)
+                else str(nslug_map or "")
             ).strip()
-            subs: list[dict[str, Any]] = []
-            for child in top.get("children") or []:
-                cname_map = child.get("name") or {}
-                cname = (
-                    cname_map.get("de-DE") or next(iter(cname_map.values()), "")
-                    if isinstance(cname_map, dict)
-                    else str(cname_map)
-                ).strip()
-                cslug_map = child.get("slug") or {}
-                cslug = (
-                    cslug_map.get("de-DE") or next(iter(cslug_map.values()), "")
-                    if isinstance(cslug_map, dict)
-                    else str(cslug_map)
-                ).strip()
-                subs.append(
-                    {
-                        "id": child.get("id"),
-                        "external_id": child.get("externalId"),
-                        "name": cname,
-                        "slug": cslug,
-                    }
-                )
-            normalized.append(
-                {
-                    "id": top.get("id"),
-                    "external_id": top.get("externalId"),
-                    "name": tname,
-                    "slug": tslug,
-                    "subcategories": subs,
-                }
-            )
+            raw_children = node.get("children") or []
+            subs = [
+                _normalize_category_node(child)
+                for child in raw_children
+                if isinstance(child, dict)
+            ]
+            return {
+                "id": node.get("id"),
+                "external_id": node.get("externalId"),
+                "name": nname,
+                "slug": nslug,
+                "subcategories": subs,
+            }
+
+        normalized: list[dict[str, Any]] = [
+            _normalize_category_node(top)
+            for top in (raw if isinstance(raw, list) else [])
+            if isinstance(top, dict)
+        ]
 
         self._categories_cache[wh_id] = normalized
         return normalized
@@ -1382,7 +1370,7 @@ class FlaschenpostApiClient:
     async def _resolve_matching_subcategory_ids(
         self, category_filter: str, warehouse_id: int
     ) -> list[str]:
-        """Resolve `subcategory_id` (`externalId`) values matching `category_filter`."""
+        """Resolve `subcategory_id` (`externalId`) values matching `category_filter` for limitless category depth."""
         tree = await self.async_get_categories(warehouse_id=warehouse_id)
         segments = [
             _normalize_category_token(seg)
@@ -1392,37 +1380,56 @@ class FlaschenpostApiClient:
         if not segments:
             return []
 
-        matched_ids: list[str] = []
-        for top in tree:
-            top_name = _normalize_category_token(top.get("name") or "")
-            top_slug = _normalize_category_token(top.get("slug") or "")
+        def _collect_external_ids(node: dict[str, Any], acc: list[str], seen: set[str]) -> None:
+            ext_id = node.get("external_id")
+            if ext_id:
+                s_id = str(ext_id)
+                if s_id not in seen:
+                    seen.add(s_id)
+                    acc.append(s_id)
+            for sub in node.get("subcategories") or []:
+                _collect_external_ids(sub, acc, seen)
 
-            if len(segments) > 1:
-                if not (_category_segment_matches(segments[0], top_name) or _category_segment_matches(segments[0], top_slug)):
-                    continue
-                for sub in top.get("subcategories") or []:
-                    ext_id = sub.get("external_id")
-                    if not ext_id:
-                        continue
-                    sub_name = _normalize_category_token(sub.get("name") or "")
-                    sub_slug = _normalize_category_token(sub.get("slug") or "")
-                    if _category_segment_matches(segments[1], sub_name) or _category_segment_matches(segments[1], sub_slug):
-                        matched_ids.append(str(ext_id))
+        def _node_matches_seg(node: dict[str, Any], seg: str) -> bool:
+            n_name = _normalize_category_token(node.get("name") or "")
+            n_slug = _normalize_category_token(node.get("slug") or "")
+            return _category_segment_matches(seg, n_name) or _category_segment_matches(seg, n_slug)
+
+        def _path_matches(path: list[dict[str, Any]], segs: list[str]) -> bool:
+            """Check if segs match nodes in path in order, ending at the current node (path[-1])."""
+            if len(path) < len(segs):
+                return False
+            if not _node_matches_seg(path[-1], segs[-1]):
+                return False
+            s_idx = len(segs) - 2
+            p_idx = len(path) - 2
+            while s_idx >= 0 and p_idx >= 0:
+                if _node_matches_seg(path[p_idx], segs[s_idx]):
+                    s_idx -= 1
+                p_idx -= 1
+            return s_idx < 0
+
+        matched_nodes: list[dict[str, Any]] = []
+
+        def _traverse(node: dict[str, Any], current_path: list[dict[str, Any]]) -> None:
+            path = [*current_path, node]
+            if len(segments) == 1:
+                if _node_matches_seg(node, segments[0]):
+                    matched_nodes.append(node)
             else:
-                seg = segments[0]
-                if _category_segment_matches(seg, top_name) or _category_segment_matches(seg, top_slug):
-                    for sub in top.get("subcategories") or []:
-                        if sub.get("external_id"):
-                            matched_ids.append(str(sub["external_id"]))
-                else:
-                    for sub in top.get("subcategories") or []:
-                        ext_id = sub.get("external_id")
-                        if not ext_id:
-                            continue
-                        sub_name = _normalize_category_token(sub.get("name") or "")
-                        sub_slug = _normalize_category_token(sub.get("slug") or "")
-                        if _category_segment_matches(seg, sub_name) or _category_segment_matches(seg, sub_slug):
-                            matched_ids.append(str(ext_id))
+                if _path_matches(path, segments):
+                    matched_nodes.append(node)
+            for child in node.get("subcategories") or []:
+                _traverse(child, path)
+
+        for top in tree:
+            _traverse(top, [])
+
+        matched_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for m_node in matched_nodes:
+            _collect_external_ids(m_node, matched_ids, seen_ids)
+
         return matched_ids
 
     async def async_search_products(
@@ -1463,8 +1470,8 @@ class FlaschenpostApiClient:
         # directly first so items are never drowned out by other categories in Elastic search
         if category and category.strip():
             sub_ids = await self._resolve_matching_subcategory_ids(category, wh_id)
-            if 1 <= len(sub_ids) <= 4:
-                for sub_id in sub_ids:
+            if sub_ids:
+                for sub_id in sub_ids[:12]:
                     sub_prods = await self._request(
                         "GET",
                         f"/php-product-api/v1/products/prv/warehouse/{wh_id}",

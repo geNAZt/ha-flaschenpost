@@ -771,6 +771,146 @@ class TestFlaschenpostHelpers(unittest.TestCase):
         )
         self.assertTrue(matches_category_filter(meat_summary, "Fleisch & Fisch"))
 
+    def test_limitless_subcategories_hierarchy_and_filtering(self) -> None:
+        """Verify recursive handling of category trees with 3, 4, or more limitless subcategory layers."""
+        async def _run() -> None:
+            # 4-layer category tree
+            deep_tree_raw = [
+                {
+                    "id": "cat-1",
+                    "externalId": "100",
+                    "name": {"de-DE": "Kochen & Vorrat"},
+                    "slug": {"de-DE": "kochen-vorrat"},
+                    "children": [
+                        {
+                            "id": "cat-2",
+                            "externalId": "200",
+                            "name": {"de-DE": "Reis & Getreide"},
+                            "slug": {"de-DE": "reis-getreide"},
+                            "children": [
+                                {
+                                    "id": "cat-3",
+                                    "externalId": "300",
+                                    "name": {"de-DE": "Loser Reis"},
+                                    "slug": {"de-DE": "loser-reis"},
+                                    "children": [
+                                        {
+                                            "id": "cat-4",
+                                            "externalId": "400",
+                                            "name": {"de-DE": "Basmati Reis"},
+                                            "slug": {"de-DE": "basmati-reis"},
+                                            "children": [],
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+
+            client = FlaschenpostApiClient(email="test@example.com", password="secret")
+            client._warehouse_id = 1
+            client._request = lambda method, url, **kw: asyncio.sleep(0, result=deep_tree_raw)  # type: ignore[assignment]
+
+            # 1. async_get_categories preserves all 4 layers
+            tree = await client.async_get_categories()
+            self.assertEqual(len(tree), 1)
+            layer1 = tree[0]
+            self.assertEqual(layer1["name"], "Kochen & Vorrat")
+            layer2 = layer1["subcategories"][0]
+            self.assertEqual(layer2["name"], "Reis & Getreide")
+            layer3 = layer2["subcategories"][0]
+            self.assertEqual(layer3["name"], "Loser Reis")
+            layer4 = layer3["subcategories"][0]
+            self.assertEqual(layer4["name"], "Basmati Reis")
+            self.assertEqual(layer4["external_id"], "400")
+
+            # 2. async_get_category_options generates dropdown options for all 4 layers
+            mgr = FlaschenpostShoppingListManager(client=client)
+            options = await mgr.async_get_category_options()
+            vals = [o["value"] for o in options]
+            labels = [o["label"] for o in options]
+
+            self.assertIn("Kochen & Vorrat", vals)
+            self.assertIn("Kochen & Vorrat (All)", labels)
+
+            self.assertIn("Kochen & Vorrat::Reis & Getreide", vals)
+            self.assertIn("Kochen & Vorrat -> Reis & Getreide (All)", labels)
+
+            self.assertIn("Kochen & Vorrat::Reis & Getreide::Loser Reis", vals)
+            self.assertIn("Kochen & Vorrat -> Reis & Getreide -> Loser Reis (All)", labels)
+
+            self.assertIn("Kochen & Vorrat::Reis & Getreide::Loser Reis::Basmati Reis", vals)
+            self.assertIn("Kochen & Vorrat -> Reis & Getreide -> Loser Reis -> Basmati Reis", labels)
+
+            # 3. _resolve_matching_subcategory_ids matches at any level and collects subcategory IDs
+            # Match layer 4 directly
+            sub_ids_l4 = await client._resolve_matching_subcategory_ids(
+                "Kochen & Vorrat -> Reis & Getreide -> Loser Reis -> Basmati Reis", 1
+            )
+            self.assertEqual(sub_ids_l4, ["400"])
+
+            # Match layer 3 with 3 segments
+            sub_ids_l3 = await client._resolve_matching_subcategory_ids(
+                "Kochen & Vorrat::Reis & Getreide::Loser Reis", 1
+            )
+            self.assertEqual(set(sub_ids_l3), {"300", "400"})
+
+            # Match layer 2 with 2 segments
+            sub_ids_l2 = await client._resolve_matching_subcategory_ids(
+                "Kochen & Vorrat -> Reis & Getreide", 1
+            )
+            self.assertEqual(set(sub_ids_l2), {"200", "300", "400"})
+
+            # Match root layer 1
+            sub_ids_l1 = await client._resolve_matching_subcategory_ids("Kochen & Vorrat", 1)
+            self.assertEqual(set(sub_ids_l1), {"100", "200", "300", "400"})
+
+            # Match partial path skipping root (e.g. "Loser Reis -> Basmati Reis")
+            sub_ids_subpath = await client._resolve_matching_subcategory_ids(
+                "Loser Reis -> Basmati Reis", 1
+            )
+            self.assertEqual(sub_ids_subpath, ["400"])
+
+            # 4. matches_category_filter with 4 layers
+            prod_4layer = {
+                "categories": [
+                    "Kochen & Vorrat",
+                    "Reis & Getreide",
+                    "Loser Reis",
+                    "Basmati Reis",
+                ],
+                "category_slugs": [
+                    "kochen-vorrat",
+                    "reis-getreide",
+                    "loser-reis",
+                    "basmati-reis",
+                ],
+            }
+            self.assertTrue(
+                matches_category_filter(
+                    prod_4layer,
+                    "Kochen & Vorrat -> Reis & Getreide -> Loser Reis -> Basmati Reis",
+                )
+            )
+            self.assertTrue(
+                matches_category_filter(
+                    prod_4layer,
+                    "Reis & Getreide::Basmati Reis",
+                )
+            )
+            self.assertTrue(matches_category_filter(prod_4layer, "Basmati Reis"))
+            self.assertFalse(matches_category_filter(prod_4layer, "Jasmin Reis"))
+            self.assertFalse(
+                matches_category_filter(
+                    prod_4layer,
+                    "Kochen & Vorrat -> Nudeln -> Basmati Reis",
+                )
+            )
+
+        asyncio.run(_run())
+
     def test_search_synonyms_and_qualifiers(self) -> None:
         self.assertIn(
             "Schwip Schwap Zero",
