@@ -3,6 +3,7 @@
   "name": "Flaschenpost",
   "codeowners": ["@geNAZt"],
   "config_flow": true,
+  "dependencies": ["http"],
   "documentation": "https://github.com/geNAZt/ha-flaschenpost",
   "integration_type": "service",
   "iot_class": "cloud_polling",
