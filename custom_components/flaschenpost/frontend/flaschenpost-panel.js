@@ -820,10 +820,16 @@ class FlaschenpostView extends HTMLElement {
     const container = root.getElementById("cart-status-card");
     if (!container) return;
 
-    const cartTotal = this._cart ? this._cart.total_eur : 0;
-    const minOrder = this._cart ? this._cart.min_order_value_eur : 25.0;
-    const minOrderPercent = Math.min(100, Math.round(((cartTotal || 0) / (minOrder || 25.0)) * 100));
-    const isReached = this._cart && this._cart.min_order_reached;
+    const hasItems = this._cart && this._cart.items && this._cart.items.length > 0;
+    const cartTotal = hasItems ? (this._cart.total_eur || 0) : 0;
+    const minOrder = this._cart ? (this._cart.min_order_value_eur || 25.0) : 25.0;
+    const minOrderPercent = hasItems
+      ? Math.min(100, Math.round(((cartTotal || 0) / (minOrder || 25.0)) * 100))
+      : 0;
+    const isReached = hasItems && Boolean(this._cart && this._cart.min_order_reached);
+    const remainingToMin = hasItems
+      ? (this._cart ? (this._cart.remaining_to_min_eur || 0) : minOrder)
+      : minOrder;
 
     const lastUpdateTitle = this._lastUpdated
       ? `Letztes Update: ${new Date(this._lastUpdated).toLocaleTimeString()} (Klicken für sofortige Aktualisierung)`
@@ -839,7 +845,7 @@ class FlaschenpostView extends HTMLElement {
       </div>
       <div title="Mindestbestellwert: ${minOrder.toFixed(2)} €">
         <div style="font-size:0.75rem; color:var(--secondary-text-color,#666); margin-bottom:2px;">
-          ${isReached ? "Mindestbestellwert erreicht! ✓" : `Noch ${(this._cart ? this._cart.remaining_to_min_eur : 0).toFixed(2)} €`}
+          ${isReached ? "Mindestbestellwert erreicht! ✓" : `Noch ${(remainingToMin || 0).toFixed(2)} €`}
         </div>
         <div class="min-order-bar">
           <div class="min-order-fill" style="width: ${minOrderPercent}%; background: ${isReached ? "#4caf50" : "#ff9800"};"></div>
@@ -1158,7 +1164,8 @@ class FlaschenpostView extends HTMLElement {
     const container = root.getElementById("modals-container");
     if (!container) return;
 
-    const cartTotal = this._cart ? this._cart.total_eur : 0;
+    const hasItems = this._cart && this._cart.items && this._cart.items.length > 0;
+    const cartTotal = hasItems ? (this._cart.total_eur || 0) : 0;
 
     let dryRunHtml = "";
     if (this._showDryRunModal && this._dryRunResult) {

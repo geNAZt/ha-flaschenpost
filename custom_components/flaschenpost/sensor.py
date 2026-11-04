@@ -250,16 +250,24 @@ class FlaschenpostCartTotalSensor(FlaschenpostEntity, SensorEntity):
 
     @property
     def native_value(self) -> float:
-        return cents_to_eur(self.coordinator.data.cart.get("totalPrice"))
+        cart = self.coordinator.data.cart or {}
+        line_items = cart.get("lineItems") or []
+        item_count = cart.get("totalLineItemQuantity", len(line_items))
+        if not line_items or item_count == 0:
+            return 0.0
+        return cents_to_eur(cart.get("totalPrice"))
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         attrs = _freshness_attrs(self.coordinator)
-        cart = self.coordinator.data.cart
+        cart = self.coordinator.data.cart or {}
         c_fields = (cart.get("custom") or {}).get("fields") or {}
         s_fields = (cart.get("shippingCustomFields") or {}).get("fields") or {}
+        line_items = cart.get("lineItems") or []
+        item_count = cart.get("totalLineItemQuantity", len(line_items))
+        is_empty = not line_items or item_count == 0
         items = []
-        for li in cart.get("lineItems") or []:
+        for li in line_items:
             name_obj = li.get("name") or {}
             name = (
                 name_obj.get("de-DE") or next(iter(name_obj.values()), "")
@@ -278,11 +286,11 @@ class FlaschenpostCartTotalSensor(FlaschenpostEntity, SensorEntity):
         attrs.update(
             {
                 "cart_id": cart.get("id"),
-                "item_count": cart.get("totalLineItemQuantity", 0),
+                "item_count": 0 if is_empty else item_count,
                 "warehouse_id": c_fields.get("RecentlyUsedWarehouseId"),
-                "goods_eur": cents_to_eur(c_fields.get("TotalGoods")),
-                "deposit_eur": cents_to_eur(c_fields.get("TotalDeposit")),
-                "delivery_fee_eur": cents_to_eur(c_fields.get("TotalDelivery")),
+                "goods_eur": 0.0 if is_empty else cents_to_eur(c_fields.get("TotalGoods")),
+                "deposit_eur": 0.0 if is_empty else cents_to_eur(c_fields.get("TotalDeposit")),
+                "delivery_fee_eur": 0.0 if is_empty else cents_to_eur(c_fields.get("TotalDelivery")),
                 "selected_slot_type": s_fields.get("SelectedDeliveryType"),
                 "selected_slot_from": s_fields.get("SelectedDeliveryFrom"),
                 "selected_slot_until": s_fields.get("SelectedDeliveryUntil"),

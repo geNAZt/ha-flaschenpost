@@ -2534,6 +2534,128 @@ class TestFlaschenpostHelpers(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_empty_cart_total_and_fee_suppression(self) -> None:
+        """Verify cart total sensor and ws_get_cart report 0.00 EUR when cart has no line items."""
+        async def _run() -> None:
+            fake_client = _FakeApiClient()
+            mgr = FlaschenpostShoppingListManager(client=fake_client)  # type: ignore[arg-type]
+            mock_entry = types.SimpleNamespace(entry_id="test_entry", title="Test Account")
+            mock_hass = types.SimpleNamespace(data={})
+
+            coord = FlaschenpostCoordinator(
+                hass=mock_hass,  # type: ignore[arg-type]
+                entry=mock_entry,  # type: ignore[arg-type]
+                client=fake_client,  # type: ignore[arg-type]
+                shopping_list=mgr,
+            )
+
+            # 1. Empty cart with staged Commercetools delivery fee (3.90 EUR) and 0 line items
+            coord.data = FlaschenpostSnapshot(
+                cart={
+                    "id": "cart-empty-1",
+                    "totalPrice": {"centAmount": 390},
+                    "shippingInfo": {"price": {"centAmount": 390}},
+                    "custom": {
+                        "fields": {
+                            "TotalGoods": {"centAmount": 0},
+                            "TotalDeposit": {"centAmount": 0},
+                            "TotalDelivery": {"centAmount": 390},
+                            "MinimumOrderValue": 2500,
+                        }
+                    },
+                    "lineItems": [],
+                    "totalLineItemQuantity": 0,
+                }
+            )
+
+            sensor = FlaschenpostCartTotalSensor(coord)
+            self.assertEqual(sensor.native_value, 0.0)
+            attrs = sensor.extra_state_attributes
+            self.assertEqual(attrs["item_count"], 0)
+            self.assertEqual(attrs["goods_eur"], 0.0)
+            self.assertEqual(attrs["delivery_fee_eur"], 0.0)
+            self.assertEqual(attrs["deposit_eur"], 0.0)
+            self.assertEqual(attrs["items"], [])
+
+            # 2. Non-empty cart
+            coord.data = FlaschenpostSnapshot(
+                cart={
+                    "id": "cart-filled-1",
+                    "totalPrice": {"centAmount": 2850},
+                    "shippingInfo": {"price": {"centAmount": 0}},
+                    "custom": {
+                        "fields": {
+                            "TotalGoods": {"centAmount": 2850},
+                            "TotalDeposit": {"centAmount": 0},
+                            "TotalDelivery": {"centAmount": 0},
+                            "MinimumOrderValue": 2500,
+                        }
+                    },
+                    "lineItems": [
+                        {
+                            "id": "li-1",
+                            "variant": {"sku": "12345"},
+                            "name": {"de-DE": "Apfelsaft"},
+                            "quantity": 2,
+                            "totalPrice": {"centAmount": 2850},
+                        }
+                    ],
+                    "totalLineItemQuantity": 2,
+                }
+            )
+            self.assertEqual(sensor.native_value, 28.5)
+            filled_attrs = sensor.extra_state_attributes
+            self.assertEqual(filled_attrs["item_count"], 2)
+            self.assertEqual(filled_attrs["goods_eur"], 28.5)
+            self.assertEqual(filled_attrs["delivery_fee_eur"], 0.0)
+
+            # 3. ws_get_cart with empty cart
+            class _EmptyCartClient(_FakeApiClient):
+                async def async_get_cart(self) -> dict[str, Any]:
+                    return {
+                        "id": "cart-empty-ws",
+                        "totalPrice": {"centAmount": 390},
+                        "shippingInfo": {"price": {"centAmount": 390}},
+                        "custom": {"fields": {"MinimumOrderValue": 2500}},
+                        "lineItems": [],
+                    }
+
+            empty_client = _EmptyCartClient()
+            empty_coord = FlaschenpostCoordinator(
+                hass=mock_hass,  # type: ignore[arg-type]
+                entry=mock_entry,  # type: ignore[arg-type]
+                client=empty_client,  # type: ignore[arg-type]
+                shopping_list=FlaschenpostShoppingListManager(client=empty_client),  # type: ignore[arg-type]
+            )
+            mock_hass.data["flaschenpost"] = {"test_entry": empty_coord}
+
+            class _MockConn:
+                def __init__(self) -> None:
+                    self.results: dict[int, Any] = {}
+                    self.errors: dict[int, tuple[str, str]] = {}
+
+                def send_result(self, msg_id: int, result: Any) -> None:
+                    self.results[msg_id] = result
+
+                def send_error(self, msg_id: int, code: str, message: str) -> None:
+                    self.errors[msg_id] = (code, message)
+
+            conn = _MockConn()
+            await ws_get_cart(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {"id": 100, "type": "flaschenpost/get_cart", "config_entry_id": "test_entry"},
+            )
+            self.assertIn(100, conn.results)
+            res = conn.results[100]
+            self.assertEqual(res["total_eur"], 0.0)
+            self.assertEqual(res["shipping_fee_eur"], 0.0)
+            self.assertFalse(res["min_order_reached"])
+            self.assertEqual(res["remaining_to_min_eur"], 25.0)
+            self.assertEqual(res["items"], [])
+
+        asyncio.run(_run())
+
 
 if __name__ == "__main__":
     unittest.main()

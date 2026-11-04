@@ -385,12 +385,28 @@ async def ws_get_cart(
                 }
             )
 
-        total_price = ((cart.get("totalPrice") or {}).get("centAmount") or 0) / 100.0
-        shipping_fee = (
-            ((cart.get("shippingInfo") or {}).get("price") or {}).get("centAmount") or 0
-        )
         custom_fields = (cart.get("custom") or {}).get("fields") or {}
         min_order = (custom_fields.get("MinimumOrderValue") or 2500) / 100.0
+
+        if not items:
+            total_price = 0.0
+            shipping_fee = 0.0
+            min_order_reached = False
+            remaining_to_min = round(min_order, 2)
+        else:
+            total_price = ((cart.get("totalPrice") or {}).get("centAmount") or 0) / 100.0
+            shipping_fee = (
+                ((cart.get("shippingInfo") or {}).get("price") or {}).get("centAmount") or 0
+            ) / 100.0
+            goods_cent = custom_fields.get("TotalGoods")
+            goods_eur = (
+                (goods_cent / 100.0)
+                if goods_cent is not None
+                else sum(it["total_eur"] for it in items)
+            )
+            min_order_reached = goods_eur >= min_order
+            remaining_to_min = round(max(0.0, min_order - goods_eur), 2)
+
         last_updated_iso = (
             coord.last_update_success_time.isoformat()
             if getattr(coord, "last_update_success_time", None)
@@ -412,10 +428,10 @@ async def ws_get_cart(
                 "cart_id": cart.get("id"),
                 "items": items,
                 "total_eur": round(total_price, 2),
-                "shipping_fee_eur": round(shipping_fee / 100.0, 2),
+                "shipping_fee_eur": round(shipping_fee, 2),
                 "min_order_value_eur": round(min_order, 2),
-                "min_order_reached": total_price >= min_order,
-                "remaining_to_min_eur": round(max(0.0, min_order - total_price), 2),
+                "min_order_reached": min_order_reached,
+                "remaining_to_min_eur": remaining_to_min,
                 "last_updated": last_updated_iso,
                 "next_update": next_update_iso,
                 "update_interval_seconds": update_interval_sec,
