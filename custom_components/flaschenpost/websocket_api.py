@@ -506,6 +506,69 @@ async def ws_buy_cart(
 
 @websocket_api.websocket_command(
     {
+        vol.Required("type"): "flaschenpost/place_order",
+        vol.Required("confirm"): bool,
+        vol.Optional("payment_method"): str,
+        vol.Optional("stored_payment_id"): str,
+        vol.Optional("iban_last4"): str,
+        vol.Optional("slot_type"): str,
+        vol.Optional("slot_from"): str,
+        vol.Optional("config_entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_place_order(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Submit purchase for current live cart (place order)."""
+    await ws_buy_cart(hass, connection, msg)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "flaschenpost/get_stored_payment_id",
+        vol.Optional("config_entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_get_stored_payment_id(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Fetch saved payment instruments and stored payment IDs."""
+    try:
+        coord = _resolve_coord(hass, msg.get("config_entry_id"))
+        methods = await coord.client.async_get_saved_payment_methods()
+        stored_payment_ids = [
+            m["stored_payment_id"] for m in methods if m.get("stored_payment_id")
+        ]
+        primary_id = stored_payment_ids[0] if stored_payment_ids else None
+        connection.send_result(
+            msg["id"],
+            {
+                "stored_payment_id": primary_id,
+                "stored_payment_ids": stored_payment_ids,
+                "payment_methods": methods,
+                "configured_payment_method": coord.config_entry.options.get(
+                    CONF_DEFAULT_PAYMENT,
+                    coord.config_entry.data.get(CONF_DEFAULT_PAYMENT, PAYMENT_CREDIT_CARD),
+                ),
+                "configured_stored_payment_id": coord.config_entry.options.get(
+                    CONF_STORED_PAYMENT_ID,
+                    coord.config_entry.data.get(CONF_STORED_PAYMENT_ID),
+                ),
+            },
+        )
+    except Exception as err:
+        _LOGGER.exception("Error in flaschenpost/get_stored_payment_id: %s", err)
+        connection.send_error(msg["id"], "error", str(err))
+
+
+@websocket_api.websocket_command(
+    {
         vol.Required("type"): "flaschenpost/set_list_config",
         vol.Required("name"): str,
         vol.Optional("random_enabled"): bool,
@@ -608,6 +671,8 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
         ws_get_cart,
         ws_sync_to_cart,
         ws_buy_cart,
+        ws_place_order,
+        ws_get_stored_payment_id,
         ws_set_list_config,
         ws_reset_list_weights,
         ws_import_cart_to_list,

@@ -488,7 +488,7 @@ class FlaschenpostView extends HTMLElement {
     this._updateModalsUi();
     try {
       const resp = await this._hass.callWS({
-        type: "flaschenpost/buy_cart",
+        type: "flaschenpost/place_order",
         confirm: true,
       });
       this._showBuyModal = false;

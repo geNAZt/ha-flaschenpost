@@ -87,7 +87,9 @@ from custom_components.flaschenpost.const import (
     DEFAULT_SHOPPING_LIST_NAME,
     PAYMENT_CREDIT_CARD,
     PAYMENT_SEPA,
-    SERVICE_BUY_CART,
+    SERVICE_GET_PAYMENT_METHODS,
+    SERVICE_GET_STORED_PAYMENT_ID,
+    SERVICE_PLACE_ORDER,
     SORT_PRICE_PER_KG,
     SORT_PRICE_PER_UNIT,
     UNIT_TYPE_CRATE,
@@ -117,7 +119,9 @@ from custom_components.flaschenpost.websocket_api import (
     ws_get_cart,
     ws_get_categories,
     ws_get_lists,
+    ws_get_stored_payment_id,
     ws_import_cart_to_list,
+    ws_place_order,
     ws_preview_lists,
     ws_preview_search,
     ws_reset_list_weights,
@@ -514,6 +518,18 @@ class _FakeApiClient:
 
     async def async_place_order(self, **kwargs: Any) -> dict[str, Any]:
         return {"id": "ord-mock-123", "orderNumber": "10042"}
+
+    async def async_get_saved_payment_methods(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "credit_card:sp-99",
+                "payment_method": "credit_card",
+                "stored_payment_id": "sp-99",
+                "brand": "visa",
+                "last4": "4242",
+                "label": "Kreditkarte VISA •••• 4242",
+            }
+        ]
 
     async def async_create_new_cart(self) -> dict[str, Any]:
         self.cleared_cart = True
@@ -1163,9 +1179,11 @@ class TestFlaschenpostHelpers(unittest.TestCase):
 
         asyncio.run(_run())
 
-    def test_buy_cart_place_order_flow(self) -> None:
+    def test_place_order_flow(self) -> None:
         async def _run() -> None:
-            self.assertEqual(SERVICE_BUY_CART, "buy_cart")
+            self.assertEqual(SERVICE_PLACE_ORDER, "place_order")
+            self.assertEqual(SERVICE_GET_STORED_PAYMENT_ID, "get_stored_payment_id")
+            self.assertEqual(SERVICE_GET_PAYMENT_METHODS, "get_payment_methods")
 
             client = FlaschenpostApiClient(email="test@example.com", password="secret")
             client._cart_id = "cart-uuid"
@@ -1582,7 +1600,7 @@ class TestFlaschenpostHelpers(unittest.TestCase):
 
             # Test command registration
             async_register_websocket_commands(mock_hass)  # type: ignore[arg-type]
-            self.assertEqual(len(registered_cmds), 15)
+            self.assertEqual(len(registered_cmds), 17)
 
             conn = _MockActiveConn()
 
@@ -1718,7 +1736,7 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             self.assertIn(11, conn.errors)
             self.assertEqual(conn.errors[11][0], "unconfirmed")
 
-            # 12. ws_buy_cart: confirmed
+            # 12. ws_buy_cart & ws_place_order: confirmed
             await ws_buy_cart(
                 mock_hass,  # type: ignore[arg-type]
                 conn,  # type: ignore[arg-type]
@@ -1730,6 +1748,31 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             )
             self.assertIn(12, conn.results)
             self.assertEqual(conn.results[12]["order_id"], "ord-mock-123")
+
+            # 12b. ws_place_order
+            await ws_place_order(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 120,
+                    "type": "flaschenpost/place_order",
+                    "confirm": True,
+                },
+            )
+            self.assertIn(120, conn.results)
+            self.assertEqual(conn.results[120]["order_id"], "ord-mock-123")
+
+            # 12c. ws_get_stored_payment_id
+            await ws_get_stored_payment_id(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 121,
+                    "type": "flaschenpost/get_stored_payment_id",
+                },
+            )
+            self.assertIn(121, conn.results)
+            self.assertIn("stored_payment_id", conn.results[121])
 
             # 13. ws_delete_list
             await ws_delete_list(

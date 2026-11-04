@@ -380,53 +380,21 @@ select_delivery_slot:
         config_entry:
           integration: flaschenpost
 
-buy_cart:
-  name: Buy current cart
-  description: Finalize checkout and buy the current Flaschenpost shopping cart using saved Credit Card, PayPal, SEPA Direct Debit, or Direct Invoice.
+get_stored_payment_id:
+  name: Get stored payment methods & IDs
+  description: Fetch saved payment instruments (Credit Cards with stored_payment_id, PayPal customer IDs, SEPA direct debits, and invoice) from your Flaschenpost profile.
   fields:
-    confirm:
-      name: Confirm paid order placement
-      description: Must be set to true to execute the paid order and dispatch delivery.
-      required: true
-      default: false
+    config_entry_id:
+      name: Account config entry ID
+      description: Optional config entry ID if multiple Flaschenpost accounts are configured.
       selector:
-        boolean:
-    payment_method:
-      name: Payment method
-      description: Defaults to your configured account payment method (credit_card, paypal, sepa, or invoice).
-      selector:
-        select:
-          options:
-            - label: "Kreditkarte (Credit Card)"
-              value: "credit_card"
-            - label: "PayPal"
-              value: "paypal"
-            - label: "SEPA Lastschrift"
-              value: "sepa"
-            - label: "Rechnung (Direct Invoice)"
-              value: "invoice"
-    stored_payment_id:
-      name: Stored payment method ID
-      description: Optional ID of a specific saved credit card or PayPal account from your Flaschenpost profile.
-      selector:
-        text:
-    iban_last4:
-      name: SEPA IBAN last 4 digits (or card last 4)
-      description: Optional override for matching a specific saved SEPA IBAN or card last 4 digits.
-      example: "1234"
-      selector:
-        text:
-    slot_type:
-      name: Slot type
-      description: Optional delivery window type (e.g. "DIRECT" or "STANDARD"). Defaults to earliest available slot.
-      example: "DIRECT"
-      selector:
-        text:
-    slot_from:
-      name: Slot start timestamp
-      description: Optional slot window start timestamp.
-      selector:
-        text:
+        config_entry:
+          integration: flaschenpost
+
+get_payment_methods:
+  name: Get payment methods
+  description: Alias for get_stored_payment_id. Fetch all saved payment methods on the account.
+  fields:
     config_entry_id:
       name: Account config entry ID
       selector:

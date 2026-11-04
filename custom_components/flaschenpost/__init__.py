@@ -34,12 +34,13 @@ from .const import (
     PAYMENT_CREDIT_CARD,
     SERVICE_ADD_LISTS_TO_CART,
     SERVICE_ADD_TO_CART,
-    SERVICE_BUY_CART,
     SERVICE_CREATE_NEW_CART,
     SERVICE_DELETE_SHOPPING_LIST,
     SERVICE_GET_CATEGORIES,
     SERVICE_GET_FAVORITES,
+    SERVICE_GET_PAYMENT_METHODS,
     SERVICE_GET_SHOPPING_LISTS,
+    SERVICE_GET_STORED_PAYMENT_ID,
     SERVICE_IMPORT_CART_TO_LIST,
     SERVICE_PLACE_ORDER,
     SERVICE_REORDER_LAST_ORDER,
@@ -86,6 +87,10 @@ ALL_SERVICES = (
     SERVICE_REORDER_LAST_ORDER,
     SERVICE_SELECT_DELIVERY_SLOT,
     SERVICE_PLACE_ORDER,
+    SERVICE_IMPORT_CART_TO_LIST,
+    SERVICE_SET_LIST_CONFIG,
+    SERVICE_GET_STORED_PAYMENT_ID,
+    SERVICE_GET_PAYMENT_METHODS,
 )
 
 
@@ -190,7 +195,7 @@ async def _async_fetch_external_ha_todo_items(
 
 PANEL_URL_PATH = "flaschenpost"
 FRONTEND_URL = "/flaschenpost_static"
-PANEL_JS_VERSION = "2.0.5"
+PANEL_JS_VERSION = "2.0.6"
 
 
 async def _async_register_frontend_panel(hass: HomeAssistant) -> None:
@@ -619,6 +624,31 @@ def _async_register_services(hass: HomeAssistant) -> None:
             "selected_until": s_fields.get("SelectedDeliveryUntil"),
         }
 
+    async def handle_get_stored_payment_id(call: ServiceCall) -> ServiceResponse:
+        coord = _resolve_coordinator(hass, call.data.get("config_entry_id"))
+        try:
+            methods = await coord.client.async_get_saved_payment_methods()
+        except FlaschenpostError as err:
+            raise HomeAssistantError(str(err)) from err
+
+        stored_payment_ids = [
+            m["stored_payment_id"] for m in methods if m.get("stored_payment_id")
+        ]
+        primary_id = stored_payment_ids[0] if stored_payment_ids else None
+        return {
+            "stored_payment_id": primary_id,
+            "stored_payment_ids": stored_payment_ids,
+            "payment_methods": methods,
+            "configured_payment_method": coord.config_entry.options.get(
+                CONF_DEFAULT_PAYMENT,
+                coord.config_entry.data.get(CONF_DEFAULT_PAYMENT, PAYMENT_CREDIT_CARD),
+            ),
+            "configured_stored_payment_id": coord.config_entry.options.get(
+                CONF_STORED_PAYMENT_ID,
+                coord.config_entry.data.get(CONF_STORED_PAYMENT_ID),
+            ),
+        }
+
     async def handle_place_order(call: ServiceCall) -> ServiceResponse:
         if not call.data.get("confirm"):
             raise ServiceValidationError(
@@ -887,10 +917,18 @@ def _async_register_services(hass: HomeAssistant) -> None:
 
     hass.services.async_register(
         DOMAIN,
-        SERVICE_BUY_CART,
-        handle_place_order,
-        schema=order_schema,
-        supports_response=SupportsResponse.OPTIONAL,
+        SERVICE_GET_STORED_PAYMENT_ID,
+        handle_get_stored_payment_id,
+        schema=vol.Schema({vol.Optional("config_entry_id"): cv.string}),
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_GET_PAYMENT_METHODS,
+        handle_get_stored_payment_id,
+        schema=vol.Schema({vol.Optional("config_entry_id"): cv.string}),
+        supports_response=SupportsResponse.ONLY,
     )
 
     hass.services.async_register(
