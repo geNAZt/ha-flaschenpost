@@ -1,6 +1,7 @@
 {
   "domain": "flaschenpost",
   "name": "Flaschenpost",
+  "categories": ["productivity_information.shopping_groceries"],
   "codeowners": ["@geNAZt"],
   "config_flow": true,
   "dependencies": ["http"],
