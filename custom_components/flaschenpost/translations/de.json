@@ -185,6 +185,12 @@
       },
       "next_delivery_slot": {
         "name": "Nächster Lieferzeitraum"
+      },
+      "next_update": {
+        "name": "Nächstes Update"
+      },
+      "last_update": {
+        "name": "Letztes Update"
       }
     },
     "binary_sensor": {
@@ -203,6 +209,9 @@
     "button": {
       "sync_shopping_list": {
         "name": "Einkaufsliste in Warenkorb übertragen"
+      },
+      "refresh": {
+        "name": "Daten aktualisieren"
       }
     }
   }

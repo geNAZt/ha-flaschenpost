@@ -8,6 +8,7 @@ import math
 import sys
 import types
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,89 @@ if "homeassistant" not in sys.modules:
     sys.modules["homeassistant.components"] = ha_comp
     sys.modules["homeassistant.components.websocket_api"] = ha_ws
 
+    ha_util = types.ModuleType("homeassistant.util")
+    ha_dt = types.ModuleType("homeassistant.util.dt")
+    ha_dt.utcnow = lambda: datetime(2026, 11, 4, 14, 0, 0, tzinfo=UTC)
+    ha_dt.parse_datetime = lambda s: datetime.fromisoformat(s) if s else None
+    ha_util.dt = ha_dt
+    sys.modules["homeassistant.util"] = ha_util
+    sys.modules["homeassistant.util.dt"] = ha_dt
+
+    ha_cfg = types.ModuleType("homeassistant.config_entries")
+    ha_cfg.ConfigEntry = object
+    sys.modules["homeassistant.config_entries"] = ha_cfg
+
+    ha_exc = types.ModuleType("homeassistant.exceptions")
+    ha_exc.ConfigEntryAuthFailed = Exception
+    sys.modules["homeassistant.exceptions"] = ha_exc
+
+    ha_helpers = types.ModuleType("homeassistant.helpers")
+    ha_coord = types.ModuleType("homeassistant.helpers.update_coordinator")
+    class DataUpdateCoordinator:
+        def __init__(self, hass: Any, logger: Any, name: str, update_interval: Any = None) -> None:
+            self.hass = hass
+            self.logger = logger
+            self.name = name
+            self.update_interval = update_interval
+            self.last_update_success = True
+            self.data: Any = None
+        def __class_getitem__(cls, item: Any) -> Any:
+            return cls
+        async def async_request_refresh(self) -> None:
+            pass
+    class CoordinatorEntity:
+        def __init__(self, coordinator: Any, *args: Any, **kwargs: Any) -> None:
+            self.coordinator = coordinator
+        def __class_getitem__(cls, item: Any) -> Any:
+            return cls
+    ha_coord.DataUpdateCoordinator = DataUpdateCoordinator
+    ha_coord.UpdateFailed = Exception
+    ha_coord.CoordinatorEntity = CoordinatorEntity
+    ha_helpers.update_coordinator = ha_coord
+    sys.modules["homeassistant.helpers"] = ha_helpers
+    sys.modules["homeassistant.helpers.update_coordinator"] = ha_coord
+
+    ha_sensor = types.ModuleType("homeassistant.components.sensor")
+    class SensorEntity:
+        pass
+    class SensorDeviceClass:
+        TIMESTAMP = "timestamp"
+        MONETARY = "monetary"
+    class SensorStateClass:
+        MEASUREMENT = "measurement"
+        TOTAL = "total"
+    ha_sensor.SensorEntity = SensorEntity
+    ha_sensor.SensorDeviceClass = SensorDeviceClass
+    ha_sensor.SensorStateClass = SensorStateClass
+    ha_comp.sensor = ha_sensor
+    sys.modules["homeassistant.components.sensor"] = ha_sensor
+
+    ha_button = types.ModuleType("homeassistant.components.button")
+    class ButtonEntity:
+        pass
+    ha_button.ButtonEntity = ButtonEntity
+    ha_comp.button = ha_button
+    sys.modules["homeassistant.components.button"] = ha_button
+
+    ha_const = types.ModuleType("homeassistant.const")
+    ha_const.CURRENCY_EURO = "€"
+    sys.modules["homeassistant.const"] = ha_const
+
+    ha_dev = types.ModuleType("homeassistant.helpers.device_registry")
+    class DeviceInfo(dict):
+        pass
+    class DeviceEntryType:
+        SERVICE = "service"
+    ha_dev.DeviceInfo = DeviceInfo
+    ha_dev.DeviceEntryType = DeviceEntryType
+    ha_helpers.device_registry = ha_dev
+    sys.modules["homeassistant.helpers.device_registry"] = ha_dev
+
+    ha_ep = types.ModuleType("homeassistant.helpers.entity_platform")
+    ha_ep.AddEntitiesCallback = object
+    ha_helpers.entity_platform = ha_ep
+    sys.modules["homeassistant.helpers.entity_platform"] = ha_ep
+
 if "custom_components.flaschenpost" not in sys.modules:
     cc_pkg = types.ModuleType("custom_components")
     cc_pkg.__path__ = [str(_ROOT / "custom_components")]
@@ -56,7 +140,7 @@ if "custom_components.flaschenpost" not in sys.modules:
     fp_pkg.__path__ = [str(_PKG_DIR)]
     sys.modules.setdefault("custom_components", cc_pkg)
     sys.modules["custom_components.flaschenpost"] = fp_pkg
-    for mod_name in ("const", "api", "shopping_list", "storage", "websocket_api"):
+    for mod_name in ("const", "api", "shopping_list", "storage", "coordinator", "entity", "sensor", "button", "websocket_api"):
         spec = importlib.util.spec_from_file_location(
             f"custom_components.flaschenpost.{mod_name}",
             _PKG_DIR / f"{mod_name}.py",
@@ -81,6 +165,7 @@ from custom_components.flaschenpost.api import (
     parse_price_per_unit_text,
     product_matches_negative_keywords,
 )
+from custom_components.flaschenpost.button import FlaschenpostRefreshButton
 from custom_components.flaschenpost.const import (
     CONF_DELIVERY_LOCATION,
     CONF_WAREHOUSE_ID,
@@ -95,6 +180,15 @@ from custom_components.flaschenpost.const import (
     UNIT_TYPE_CRATE,
     UNIT_TYPE_UNIT,
     UNIT_TYPE_WEIGHT_G,
+)
+from custom_components.flaschenpost.coordinator import (
+    FlaschenpostCoordinator,
+    FlaschenpostSnapshot,
+)
+from custom_components.flaschenpost.sensor import (
+    FlaschenpostCartTotalSensor,
+    FlaschenpostLastUpdateSensor,
+    FlaschenpostNextUpdateSensor,
 )
 from custom_components.flaschenpost.shopping_list import (
     DEFAULT_ITEM_WEIGHT,
@@ -124,6 +218,7 @@ from custom_components.flaschenpost.websocket_api import (
     ws_place_order,
     ws_preview_lists,
     ws_preview_search,
+    ws_refresh,
     ws_reset_list_weights,
     ws_save_list,
     ws_set_list_config,
@@ -1719,6 +1814,9 @@ class TestFlaschenpostHelpers(unittest.TestCase):
                 self.config_entry = _MockEntry()
                 self.updated_listeners = False
                 self.refreshed = False
+                self.last_update_success_time = datetime(2026, 11, 4, 12, 0, 0, tzinfo=UTC)
+                self.next_update_time = datetime(2026, 11, 4, 12, 5, 0, tzinfo=UTC)
+                self.update_interval = timedelta(minutes=5)
 
             def async_update_listeners(self) -> None:
                 self.updated_listeners = True
@@ -1740,7 +1838,7 @@ class TestFlaschenpostHelpers(unittest.TestCase):
 
             # Test command registration
             async_register_websocket_commands(mock_hass)  # type: ignore[arg-type]
-            self.assertEqual(len(registered_cmds), 17)
+            self.assertEqual(len(registered_cmds), 18)
 
             conn = _MockActiveConn()
 
@@ -1849,6 +1947,9 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             await ws_get_cart(mock_hass, conn, {"id": 9, "type": "flaschenpost/get_cart"})  # type: ignore[arg-type]
             self.assertIn(9, conn.results)
             self.assertIn("min_order_value_eur", conn.results[9])
+            self.assertIn("last_updated", conn.results[9])
+            self.assertIn("next_update", conn.results[9])
+            self.assertEqual(conn.results[9]["update_interval_seconds"], 300)
 
             # 10. ws_sync_to_cart
             await ws_sync_to_cart(
@@ -1971,6 +2072,21 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             )
             self.assertIn(16, conn.results)
             self.assertTrue(conn.results[16]["success"])
+
+            # 17. ws_refresh
+            await ws_refresh(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 17,
+                    "type": "flaschenpost/refresh",
+                },
+            )
+            self.assertIn(17, conn.results)
+            self.assertTrue(conn.results[17]["success"])
+            self.assertIn("last_updated", conn.results[17])
+            self.assertIn("next_update", conn.results[17])
+            self.assertEqual(conn.results[17]["update_interval_seconds"], 300)
 
             # 14. Verify frontend panel JS asset exists and contains web component
             panel_js_file = _PKG_DIR / "frontend" / "flaschenpost-panel.js"
@@ -2346,6 +2462,75 @@ class TestFlaschenpostHelpers(unittest.TestCase):
                 self.assertNotIn("Drinks", mgr3.list_names)
                 self.assertEqual(len(mgr3.get_list_items("Weekly Grocery")), 2)
                 storage3.close()
+
+        asyncio.run(_run())
+
+    def test_update_countdown_and_freshness_sensors(self) -> None:
+        """Verify coordinator timestamps, adaptive delivery intervals, and freshness sensors."""
+        async def _run() -> None:
+            fake_client = _FakeApiClient()
+            mgr = FlaschenpostShoppingListManager(client=fake_client)  # type: ignore[arg-type]
+            mock_entry = types.SimpleNamespace(entry_id="test_entry", title="Test Account")
+            mock_hass = types.SimpleNamespace(data={})
+
+            coord = FlaschenpostCoordinator(
+                hass=mock_hass,  # type: ignore[arg-type]
+                entry=mock_entry,  # type: ignore[arg-type]
+                client=fake_client,  # type: ignore[arg-type]
+                shopping_list=mgr,
+            )
+
+            # 1. Initially timestamps are None
+            self.assertIsNone(coord.last_update_success_time)
+            self.assertIsNone(coord.next_update_time)
+
+            # 2. Simulate successful update
+            now_utc = datetime(2026, 11, 4, 14, 0, 0, tzinfo=UTC)
+            coord.last_update_success_time = now_utc
+            self.assertEqual(coord.update_interval, timedelta(minutes=5))
+            self.assertEqual(coord.next_update_time, now_utc + timedelta(minutes=5))
+
+            # 3. Simulate active delivery snapshot (adaptive polling speedup to 60s)
+            coord.data = FlaschenpostSnapshot(
+                active_orders=[{"id": "order-123"}],
+                cart={"totalPrice": {"centAmount": 4550}},
+            )
+            coord.update_interval = timedelta(seconds=60)
+            self.assertEqual(coord.next_update_time, now_utc + timedelta(seconds=60))
+
+            # 4. Next update sensor
+            next_sensor = FlaschenpostNextUpdateSensor(coord)
+            self.assertEqual(next_sensor.native_value, now_utc + timedelta(seconds=60))
+            attrs = next_sensor.extra_state_attributes
+            self.assertEqual(attrs["last_updated"], now_utc.isoformat())
+            self.assertEqual(attrs["update_interval_seconds"], 60)
+            self.assertEqual(attrs["update_interval_human"], "1m")
+            self.assertTrue(attrs["active_delivery_mode"])
+            self.assertEqual(attrs["last_update_status"], "success")
+
+            # 5. Last update sensor
+            last_sensor = FlaschenpostLastUpdateSensor(coord)
+            self.assertEqual(last_sensor.native_value, now_utc)
+            last_attrs = last_sensor.extra_state_attributes
+            self.assertEqual(last_attrs["next_update"], (now_utc + timedelta(seconds=60)).isoformat())
+            self.assertEqual(last_attrs["update_interval_seconds"], 60)
+            self.assertTrue(last_attrs["active_delivery_mode"])
+
+            # 6. Cart total sensor includes freshness attributes
+            cart_sensor = FlaschenpostCartTotalSensor(coord)
+            cart_attrs = cart_sensor.extra_state_attributes
+            self.assertEqual(cart_attrs["last_updated"], now_utc.isoformat())
+            self.assertEqual(cart_attrs["next_update"], (now_utc + timedelta(seconds=60)).isoformat())
+
+            # 7. Refresh button
+            refreshed = False
+            async def _fake_refresh() -> None:
+                nonlocal refreshed
+                refreshed = True
+            coord.async_request_refresh = _fake_refresh  # type: ignore[method-assign]
+            btn = FlaschenpostRefreshButton(coord)
+            await btn.async_press()
+            self.assertTrue(refreshed)
 
         asyncio.run(_run())
 

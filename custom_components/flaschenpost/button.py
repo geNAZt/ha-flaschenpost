@@ -19,7 +19,12 @@ async def async_setup_entry(
 ) -> None:
     """Set up Flaschenpost action buttons."""
     coordinator: FlaschenpostCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([FlaschenpostSyncListButton(coordinator)])
+    async_add_entities(
+        [
+            FlaschenpostSyncListButton(coordinator),
+            FlaschenpostRefreshButton(coordinator),
+        ]
+    )
 
 
 class FlaschenpostSyncListButton(FlaschenpostEntity, ButtonEntity):
@@ -34,4 +39,18 @@ class FlaschenpostSyncListButton(FlaschenpostEntity, ButtonEntity):
     async def async_press(self) -> None:
         """Sync shopping list items to remote Flaschenpost cart and refresh."""
         await self.coordinator.shopping_list.async_sync_to_cart(mark_completed=True)
+        await self.coordinator.async_request_refresh()
+
+
+class FlaschenpostRefreshButton(FlaschenpostEntity, ButtonEntity):
+    """Trigger an immediate Flaschenpost data refresh."""
+
+    _attr_translation_key = "refresh"
+    _attr_icon = "mdi:refresh"
+
+    def __init__(self, coordinator: FlaschenpostCoordinator) -> None:
+        super().__init__(coordinator, "refresh")
+
+    async def async_press(self) -> None:
+        """Fetch latest Flaschenpost data immediately."""
         await self.coordinator.async_request_refresh()

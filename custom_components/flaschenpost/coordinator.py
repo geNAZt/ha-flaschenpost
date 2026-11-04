@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .api import FlaschenpostApiClient, FlaschenpostAuthError, FlaschenpostError
 from .const import DOMAIN, SCAN_INTERVAL_ACTIVE_DELIVERY, SCAN_INTERVAL_IDLE
@@ -54,6 +56,14 @@ class FlaschenpostCoordinator(DataUpdateCoordinator[FlaschenpostSnapshot]):
         self.config_entry = entry
         self.client = client
         self.shopping_list = shopping_list
+        self.last_update_success_time: datetime | None = None
+
+    @property
+    def next_update_time(self) -> datetime | None:
+        """Return estimated timestamp of the next coordinator poll."""
+        if self.last_update_success_time is None or self.update_interval is None:
+            return None
+        return self.last_update_success_time + self.update_interval
 
     async def _async_update_data(self) -> FlaschenpostSnapshot:
         """Fetch latest account, cart, active order tracking, history, and slots."""
@@ -95,6 +105,8 @@ class FlaschenpostCoordinator(DataUpdateCoordinator[FlaschenpostSnapshot]):
             )
             if self.update_interval != desired_interval:
                 self.update_interval = desired_interval
+
+            self.last_update_success_time = dt_util.utcnow()
 
             return FlaschenpostSnapshot(
                 account=account,

@@ -38,10 +38,25 @@ class FlaschenpostView extends HTMLElement {
     this._buyConfirmChecked = false;
     this._buyLoading = false;
     this._actionMessage = null;
+    this._nextUpdate = null;
+    this._lastUpdated = null;
+    this._updateIntervalSeconds = 300;
+    this._countdownInterval = null;
+    this._isRefreshing = false;
   }
 
   connectedCallback() {
     this._ensureDom();
+    if (!this._countdownInterval) {
+      this._countdownInterval = setInterval(() => this._tickCountdown(), 1000);
+    }
+  }
+
+  disconnectedCallback() {
+    if (this._countdownInterval) {
+      clearInterval(this._countdownInterval);
+      this._countdownInterval = null;
+    }
   }
 
   set hass(hass) {
@@ -111,9 +126,67 @@ class FlaschenpostView extends HTMLElement {
       const resp = await this._hass.callWS({ type: "flaschenpost/get_cart" });
       if (resp) {
         this._cart = resp;
+        if (resp.next_update) this._nextUpdate = resp.next_update;
+        if (resp.last_updated) this._lastUpdated = resp.last_updated;
+        if (resp.update_interval_seconds) this._updateIntervalSeconds = resp.update_interval_seconds;
+        this._updateCartUi();
       }
     } catch (err) {
       console.warn("Failed to fetch cart:", err);
+    }
+  }
+
+  _getInitialCountdownText() {
+    if (this._isRefreshing) return "Aktualisiere...";
+    if (!this._nextUpdate) return "Update...";
+    const now = new Date().getTime();
+    const target = new Date(this._nextUpdate).getTime();
+    const diffSec = Math.max(0, Math.round((target - now) / 1000));
+    if (diffSec <= 0) return "Aktualisiere...";
+    const m = Math.floor(diffSec / 60);
+    const s = diffSec % 60;
+    return `Update in ${m}:${s < 10 ? "0" : ""}${s}`;
+  }
+
+  _tickCountdown() {
+    if (!this._nextUpdate) return;
+    const now = new Date().getTime();
+    const target = new Date(this._nextUpdate).getTime();
+    const diffSec = Math.max(0, Math.round((target - now) / 1000));
+    const countdownEl = this.shadowRoot ? this.shadowRoot.getElementById("update-countdown-text") : null;
+    if (countdownEl) {
+      if (this._isRefreshing) {
+        countdownEl.textContent = "Aktualisiere...";
+      } else if (diffSec <= 0) {
+        countdownEl.textContent = "Aktualisiere...";
+        if (!this._isRefreshing && now - target < 4000) {
+          this._manualRefresh(false);
+        }
+      } else {
+        const m = Math.floor(diffSec / 60);
+        const s = diffSec % 60;
+        countdownEl.textContent = `Update in ${m}:${s < 10 ? "0" : ""}${s}`;
+      }
+    }
+  }
+
+  async _manualRefresh(showToast = true) {
+    if (!this._hass || this._isRefreshing) return;
+    this._isRefreshing = true;
+    const iconEl = this.shadowRoot ? this.shadowRoot.getElementById("update-refresh-icon") : null;
+    if (iconEl) iconEl.style.transform = "rotate(360deg)";
+    if (showToast) this._showToast("Aktualisiere Flaschenpost-Daten...");
+    try {
+      await this._hass.callWS({ type: "flaschenpost/refresh" });
+      await this._fetchCart();
+      if (showToast) this._showToast("Daten aktualisiert! ✓");
+    } catch (err) {
+      console.warn("Refresh failed:", err);
+      if (showToast) this._showToast(`Fehler: ${err.message || err}`, true);
+    } finally {
+      this._isRefreshing = false;
+      this._tickCountdown();
+      if (iconEl) iconEl.style.transform = "none";
     }
   }
 
@@ -752,7 +825,15 @@ class FlaschenpostView extends HTMLElement {
     const minOrderPercent = Math.min(100, Math.round(((cartTotal || 0) / (minOrder || 25.0)) * 100));
     const isReached = this._cart && this._cart.min_order_reached;
 
+    const lastUpdateTitle = this._lastUpdated
+      ? `Letztes Update: ${new Date(this._lastUpdated).toLocaleTimeString()} (Klicken für sofortige Aktualisierung)`
+      : "Klicken für sofortige Aktualisierung";
+
     container.innerHTML = `
+      <div class="cart-pill" id="btn-manual-refresh" title="${lastUpdateTitle}" style="cursor: pointer; display: flex; align-items: center; gap: 6px; user-select: none;">
+        <span id="update-refresh-icon" style="display: inline-block; transition: transform 0.5s ease;">🔄</span>
+        <span id="update-countdown-text">${this._getInitialCountdownText()}</span>
+      </div>
       <div class="cart-pill">
         Warenkorb: <strong>${(cartTotal || 0).toFixed(2)} €</strong>
       </div>
@@ -770,6 +851,11 @@ class FlaschenpostView extends HTMLElement {
         <button class="btn-success" id="btn-buy-modal">⚡ Bestellen</button>
       </div>
     `;
+
+    const btnRefresh = container.querySelector("#btn-manual-refresh");
+    if (btnRefresh) {
+      btnRefresh.addEventListener("click", () => this._manualRefresh(true));
+    }
 
     const btnDryRun = container.querySelector("#btn-dryrun-cart");
     if (btnDryRun) {

@@ -391,6 +391,21 @@ async def ws_get_cart(
         )
         custom_fields = (cart.get("custom") or {}).get("fields") or {}
         min_order = (custom_fields.get("MinimumOrderValue") or 2500) / 100.0
+        last_updated_iso = (
+            coord.last_update_success_time.isoformat()
+            if getattr(coord, "last_update_success_time", None)
+            else None
+        )
+        next_update_iso = (
+            coord.next_update_time.isoformat()
+            if getattr(coord, "next_update_time", None)
+            else None
+        )
+        update_interval_sec = (
+            int(coord.update_interval.total_seconds())
+            if getattr(coord, "update_interval", None)
+            else 300
+        )
         connection.send_result(
             msg["id"],
             {
@@ -401,6 +416,9 @@ async def ws_get_cart(
                 "min_order_value_eur": round(min_order, 2),
                 "min_order_reached": total_price >= min_order,
                 "remaining_to_min_eur": round(max(0.0, min_order - total_price), 2),
+                "last_updated": last_updated_iso,
+                "next_update": next_update_iso,
+                "update_interval_seconds": update_interval_sec,
             },
         )
     except Exception as err:
@@ -656,6 +674,48 @@ async def ws_import_cart_to_list(
         connection.send_error(msg["id"], "error", str(err))
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "flaschenpost/refresh",
+        vol.Optional("config_entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_refresh(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Trigger an immediate coordinator refresh."""
+    try:
+        coord = _resolve_coord(hass, msg.get("config_entry_id"))
+        await coord.async_request_refresh()
+        connection.send_result(
+            msg["id"],
+            {
+                "success": True,
+                "last_updated": (
+                    coord.last_update_success_time.isoformat()
+                    if getattr(coord, "last_update_success_time", None)
+                    else None
+                ),
+                "next_update": (
+                    coord.next_update_time.isoformat()
+                    if getattr(coord, "next_update_time", None)
+                    else None
+                ),
+                "update_interval_seconds": (
+                    int(coord.update_interval.total_seconds())
+                    if getattr(coord, "update_interval", None)
+                    else 300
+                ),
+            },
+        )
+    except Exception as err:
+        _LOGGER.exception("Error in flaschenpost/refresh: %s", err)
+        connection.send_error(msg["id"], "error", str(err))
+
+
 def async_register_websocket_commands(hass: HomeAssistant) -> None:
     """Register all Flaschenpost WebSocket commands."""
     commands = [
@@ -676,6 +736,7 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
         ws_set_list_config,
         ws_reset_list_weights,
         ws_import_cart_to_list,
+        ws_refresh,
     ]
     for cmd in commands:
         websocket_api.async_register_command(hass, cmd)

@@ -185,6 +185,12 @@
       },
       "next_delivery_slot": {
         "name": "Next delivery slot"
+      },
+      "next_update": {
+        "name": "Next update"
+      },
+      "last_update": {
+        "name": "Last update"
       }
     },
     "binary_sensor": {
@@ -203,6 +209,9 @@
     "button": {
       "sync_shopping_list": {
         "name": "Sync shopping list to cart"
+      },
+      "refresh": {
+        "name": "Refresh data"
       }
     }
   }
