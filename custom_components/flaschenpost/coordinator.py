@@ -31,6 +31,7 @@ class FlaschenpostSnapshot:
     past_orders: list[dict[str, Any]] = field(default_factory=list)
     past_orders_total: int = 0
     all_orders: list[dict[str, Any]] = field(default_factory=list)
+    list_spends: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     slots_response: dict[str, Any] = field(default_factory=dict)
     available_slots: list[dict[str, Any]] = field(default_factory=list)
 
@@ -112,6 +113,10 @@ class FlaschenpostCoordinator(DataUpdateCoordinator[FlaschenpostSnapshot]):
                         seen.add(oid)
                         all_orders.append(o)
 
+            list_spends: dict[str, list[dict[str, Any]]] = {}
+            if self.shopping_list and hasattr(self.shopping_list, "async_get_all_list_spends"):
+                list_spends = await self.shopping_list.async_get_all_list_spends()
+
             slots_resp = await self.client.async_get_delivery_slots(
                 cart=cart, account=account
             )
@@ -136,6 +141,7 @@ class FlaschenpostCoordinator(DataUpdateCoordinator[FlaschenpostSnapshot]):
                 past_orders=past_orders,
                 past_orders_total=past_total,
                 all_orders=all_orders,
+                list_spends=list_spends,
                 slots_response=slots_resp,
                 available_slots=available_slots,
             )

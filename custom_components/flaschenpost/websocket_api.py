@@ -538,6 +538,10 @@ async def ws_buy_cart(
             slot_from=msg.get("slot_from"),
         )
 
+        if hasattr(coord, "shopping_list") and coord.shopping_list:
+            with contextlib.suppress(Exception):
+                await coord.shopping_list.async_record_order_attributions(order)
+
         if applied_coupon and hasattr(coord, "shopping_list") and coord.shopping_list:
             order_ref = str(order.get("id") or order.get("orderNumber") or "")
             with contextlib.suppress(Exception):

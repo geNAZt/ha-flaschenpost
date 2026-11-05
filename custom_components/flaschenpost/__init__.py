@@ -402,6 +402,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
         coord = _resolve_coordinator(hass, call.data.get("config_entry_id"))
         try:
             cart = await coord.client.async_create_new_cart()
+            if hasattr(coord, "shopping_list") and coord.shopping_list:
+                with contextlib.suppress(Exception):
+                    await coord.shopping_list.async_clear_cart_attributions()
         except FlaschenpostError as err:
             raise HomeAssistantError(str(err)) from err
 
@@ -692,6 +695,10 @@ def _async_register_services(hass: HomeAssistant) -> None:
             )
         except FlaschenpostError as err:
             raise HomeAssistantError(str(err)) from err
+
+        if hasattr(coord, "shopping_list") and coord.shopping_list:
+            with contextlib.suppress(Exception):
+                await coord.shopping_list.async_record_order_attributions(order)
 
         if applied_coupon and hasattr(coord, "shopping_list") and coord.shopping_list:
             order_ref = str(order.get("id") or order.get("orderNumber") or "")

@@ -203,6 +203,18 @@
       },
       "total_spent": {
         "name": "Ausgaben gesamt"
+      },
+      "list_weekly_spent": {
+        "name": "{list_name} Ausgaben diese Woche"
+      },
+      "list_monthly_spent": {
+        "name": "{list_name} Ausgaben diesen Monat"
+      },
+      "list_yearly_spent": {
+        "name": "{list_name} Ausgaben dieses Jahr"
+      },
+      "list_total_spent": {
+        "name": "{list_name} Ausgaben gesamt"
       }
     },
     "binary_sensor": {

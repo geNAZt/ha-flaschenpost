@@ -9,6 +9,7 @@ import re
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from .api import (
@@ -595,6 +596,7 @@ class _MergedRequirement:
     negative_keywords: list[str] = field(default_factory=list)
     source_lists: list[str] = field(default_factory=list)
     source_items: list[ShoppingListItem] = field(default_factory=list)
+    list_amounts: dict[str, float] = field(default_factory=dict)
 
 
 class FlaschenpostShoppingListManager:
@@ -620,6 +622,8 @@ class FlaschenpostShoppingListManager:
         self._list_deleted_callbacks: list[Callable[[str], None]] = []
         self._in_memory_coupons: list[dict[str, Any]] = []
         self._in_memory_recorded_orders: list[dict[str, Any]] = []
+        self._in_memory_cart_attributions: dict[int, dict[str, float]] = {}
+        self._in_memory_list_spends: dict[str, list[dict[str, Any]]] = {}
 
     @property
     def storage(self) -> Any | None:
@@ -718,6 +722,174 @@ class FlaschenpostShoppingListManager:
         if self._storage and hasattr(self._storage, "async_get_all_recorded_orders"):
             return await self._storage.async_get_all_recorded_orders()
         return list(self._in_memory_recorded_orders)
+
+    async def async_set_cart_attributions(
+        self, attributions: dict[int, dict[str, float]], clear_existing: bool = False
+    ) -> None:
+        """Store or update cart item attributions ({article_id: {list_name: quantity}})."""
+        if self._storage and hasattr(self._storage, "async_set_cart_attributions"):
+            await self._storage.async_set_cart_attributions(
+                attributions, clear_existing=clear_existing
+            )
+        if clear_existing:
+            self._in_memory_cart_attributions.clear()
+        for aid, list_map in attributions.items():
+            for lname, q in list_map.items():
+                if clear_existing:
+                    self._in_memory_cart_attributions.setdefault(aid, {})[lname] = q
+                else:
+                    self._in_memory_cart_attributions.setdefault(aid, {})[lname] = (
+                        self._in_memory_cart_attributions.setdefault(aid, {}).get(lname, 0.0) + q
+                    )
+
+    async def async_get_cart_attributions(self) -> dict[int, dict[str, float]]:
+        """Return all active cart item attributions."""
+        if self._storage and hasattr(self._storage, "async_get_cart_attributions"):
+            return await self._storage.async_get_cart_attributions()
+        return dict(self._in_memory_cart_attributions)
+
+    async def async_clear_cart_attributions(self) -> None:
+        """Clear all active cart item attributions."""
+        if self._storage and hasattr(self._storage, "async_clear_cart_attributions"):
+            await self._storage.async_clear_cart_attributions()
+        self._in_memory_cart_attributions.clear()
+
+    async def async_record_order_attributions(self, order: dict[str, Any]) -> None:
+        """Record per-list item provenance and monetary breakdown when an order is placed."""
+        order_id = str(order.get("id") or "")
+        if not order_id:
+            return
+        created_at = str(order.get("createdAt") or datetime.now(UTC).isoformat())
+
+        cart_attrs = await self.async_get_cart_attributions()
+        line_items = order.get("lineItems") or []
+
+        list_items: list[dict[str, Any]] = []
+        list_goods_cents: dict[str, int] = {}
+        list_item_counts: dict[str, int] = {}
+
+        for li in line_items:
+            sku = (li.get("variant") or {}).get("sku")
+            aid = int(sku) if sku and str(sku).isdigit() else None
+            tot_price = li.get("totalPrice")
+            li_cents = (
+                tot_price.get("centAmount", 0)
+                if isinstance(tot_price, dict)
+                else int(tot_price or 0)
+            )
+            li_qty = int(li.get("quantity") or 1)
+            name_obj = li.get("name") or {}
+            name = (
+                name_obj.get("de-DE") or next(iter(name_obj.values()), "")
+                if isinstance(name_obj, dict)
+                else str(name_obj)
+            )
+
+            attr_map = cart_attrs.get(aid) if aid is not None else None
+            if not attr_map:
+                attr_map = {DEFAULT_SHOPPING_LIST_NAME: float(li_qty)}
+
+            tot_attr_q = sum(attr_map.values())
+            running_cents = 0
+            items_list = list(attr_map.items())
+
+            for idx, (lname, lqty) in enumerate(items_list):
+                if idx == len(items_list) - 1:
+                    alloc_cents = li_cents - running_cents
+                else:
+                    ratio = lqty / tot_attr_q if tot_attr_q > 0 else 1.0 / len(items_list)
+                    alloc_cents = round(li_cents * ratio)
+                    running_cents += alloc_cents
+
+                alloc_q = round(li_qty * (lqty / tot_attr_q if tot_attr_q > 0 else 1.0 / len(items_list)), 2)
+                list_goods_cents[lname] = list_goods_cents.get(lname, 0) + alloc_cents
+                list_item_counts[lname] = list_item_counts.get(lname, 0) + 1
+                list_items.append(
+                    {
+                        "list_name": lname,
+                        "article_id": aid,
+                        "name": name,
+                        "quantity": alloc_q,
+                        "total_cents": alloc_cents,
+                        "created_at": created_at,
+                    }
+                )
+
+        cf = (order.get("custom") or {}).get("fields") or {}
+        td = cf.get("TotalDeposit")
+        deposit_cents = (td.get("centAmount", 0) if isinstance(td, dict) else int(td or 0))
+        tfee = cf.get("TotalDelivery")
+        delivery_fee_cents = (tfee.get("centAmount", 0) if isinstance(tfee, dict) else int(tfee or 0))
+
+        total_goods_all = sum(list_goods_cents.values())
+        list_spends: list[dict[str, Any]] = []
+
+        if not list_goods_cents:
+            tot_p = order.get("totalPrice")
+            tot_c = (tot_p.get("centAmount", 0) if isinstance(tot_p, dict) else int(tot_p or 0))
+            list_spends.append(
+                {
+                    "list_name": DEFAULT_SHOPPING_LIST_NAME,
+                    "goods_cents": 0,
+                    "deposit_cents": deposit_cents,
+                    "delivery_fee_cents": delivery_fee_cents,
+                    "total_cents": tot_c,
+                    "items_count": 0,
+                    "created_at": created_at,
+                }
+            )
+        else:
+            dep_running = 0
+            deliv_running = 0
+            sorted_lists = list(list_goods_cents.keys())
+            for idx, lname in enumerate(sorted_lists):
+                lgoods = list_goods_cents[lname]
+                if idx == len(sorted_lists) - 1:
+                    ldep = deposit_cents - dep_running
+                    ldeliv = delivery_fee_cents - deliv_running
+                else:
+                    share = lgoods / total_goods_all if total_goods_all > 0 else 1.0 / len(sorted_lists)
+                    ldep = round(deposit_cents * share)
+                    ldeliv = round(delivery_fee_cents * share)
+                    dep_running += ldep
+                    deliv_running += ldeliv
+
+                ltotal = lgoods + ldep + ldeliv
+                list_spends.append(
+                    {
+                        "list_name": lname,
+                        "goods_cents": lgoods,
+                        "deposit_cents": ldep,
+                        "delivery_fee_cents": ldeliv,
+                        "total_cents": ltotal,
+                        "items_count": list_item_counts.get(lname, 0),
+                        "created_at": created_at,
+                    }
+                )
+
+        if self._storage and hasattr(self._storage, "async_record_order_list_spends"):
+            await self._storage.async_record_order_list_spends(
+                order_id=order_id,
+                spends=list_spends,
+                items=list_items,
+            )
+        else:
+            for s in list_spends:
+                self._in_memory_list_spends.setdefault(s["list_name"], []).append(
+                    {
+                        **s,
+                        "order_id": order_id,
+                        "items": [it for it in list_items if it["list_name"] == s["list_name"]],
+                    }
+                )
+
+        await self.async_clear_cart_attributions()
+
+    async def async_get_all_list_spends(self) -> dict[str, list[dict[str, Any]]]:
+        """Return all historical order list spends grouped by list_name."""
+        if self._storage and hasattr(self._storage, "async_get_all_list_spends"):
+            return await self._storage.async_get_all_list_spends()
+        return dict(self._in_memory_list_spends)
 
     @property
     def list_names(self) -> list[str]:
@@ -1479,6 +1651,7 @@ class FlaschenpostShoppingListManager:
                             negative_keywords=list(item.negative_keywords),
                             source_lists=[internal_key],
                             source_items=[item],
+                            list_amounts={internal_key: item.target_amount_base},
                         )
                     else:
                         req = merged_map[mkey]
@@ -1488,6 +1661,9 @@ class FlaschenpostShoppingListManager:
                         if internal_key not in req.source_lists:
                             req.source_lists.append(internal_key)
                         req.source_items.append(item)
+                        req.list_amounts[internal_key] = round(
+                            req.list_amounts.get(internal_key, 0.0) + item.target_amount_base, 2
+                        )
             elif external_list_items and requested_name in external_list_items:
                 matched_lists.append(requested_name)
                 for raw_line in external_list_items[requested_name]:
@@ -1513,6 +1689,8 @@ class FlaschenpostShoppingListManager:
                             sort_by=eff_sort,
                             negative_keywords=list(temp_item.negative_keywords),
                             source_lists=[requested_name],
+                            source_items=[],
+                            list_amounts={requested_name: temp_item.target_amount_base},
                         )
                     else:
                         req = merged_map[mkey]
@@ -1521,6 +1699,9 @@ class FlaschenpostShoppingListManager:
                         )
                         if requested_name not in req.source_lists:
                             req.source_lists.append(requested_name)
+                        req.list_amounts[requested_name] = round(
+                            req.list_amounts.get(requested_name, 0.0) + temp_item.target_amount_base, 2
+                        )
             else:
                 missing_lists.append(requested_name)
 
@@ -1529,6 +1710,7 @@ class FlaschenpostShoppingListManager:
             if clear_cart_first and not dry_run:
                 cart = await self._client.async_create_new_cart()
                 cart_id = cart.get("id")
+                await self.async_clear_cart_attributions()
             return {
                 "lists_merged": matched_lists,
                 "missing_lists": missing_lists,
@@ -1555,6 +1737,7 @@ class FlaschenpostShoppingListManager:
         resolved_reports: list[dict[str, Any]] = []
         unresolved: list[str] = []
         completed_candidates: list[ShoppingListItem] = []
+        current_sync_attrs: dict[int, dict[str, float]] = {}
 
         for req in merged_map.values():
             core_label = (
@@ -1582,6 +1765,14 @@ class FlaschenpostShoppingListManager:
             qty = int(resolution["quantity"])
             prod = resolution.get("product") or {}
             desired_deltas[aid] = desired_deltas.get(aid, 0) + qty
+
+            tot_target = sum(req.list_amounts.values())
+            for lname, lamt in req.list_amounts.items():
+                ratio = lamt / tot_target if tot_target > 0 else 1.0 / len(req.list_amounts)
+                alloc_q = round(qty * ratio, 4)
+                current_sync_attrs.setdefault(aid, {})[lname] = (
+                    current_sync_attrs.setdefault(aid, {}).get(lname, 0.0) + alloc_q
+                )
 
             delivered_str = format_base_amount(
                 req.unit_type, float(resolution["delivered_amount_base"])
@@ -1627,6 +1818,10 @@ class FlaschenpostShoppingListManager:
                 for aid, delta in desired_deltas.items()
             ]
             cart = await self._client.async_set_cart_positions(positions)
+            if current_sync_attrs:
+                await self.async_set_cart_attributions(
+                    current_sync_attrs, clear_existing=clear_cart_first
+                )
             if mark_completed:
                 for item in completed_candidates:
                     item.completed = True

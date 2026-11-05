@@ -158,6 +158,49 @@ class FlaschenpostSqliteStorage:
                     ON orders(created_at);"""
                 )
                 conn.execute(
+                    """CREATE TABLE IF NOT EXISTS cart_item_attributions (
+                        article_id INTEGER NOT NULL,
+                        list_name TEXT NOT NULL,
+                        quantity REAL NOT NULL DEFAULT 1.0,
+                        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        PRIMARY KEY (article_id, list_name)
+                    );"""
+                )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS order_list_spends (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        order_id TEXT NOT NULL,
+                        list_name TEXT NOT NULL,
+                        goods_cents INTEGER NOT NULL DEFAULT 0,
+                        deposit_cents INTEGER NOT NULL DEFAULT 0,
+                        delivery_fee_cents INTEGER NOT NULL DEFAULT 0,
+                        total_cents INTEGER NOT NULL DEFAULT 0,
+                        items_count INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(order_id, list_name)
+                    );"""
+                )
+                conn.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_order_list_spends_list_created
+                    ON order_list_spends(list_name, created_at);"""
+                )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS order_list_items (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        order_id TEXT NOT NULL,
+                        list_name TEXT NOT NULL,
+                        article_id INTEGER,
+                        name TEXT,
+                        quantity REAL NOT NULL DEFAULT 1.0,
+                        total_cents INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL
+                    );"""
+                )
+                conn.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_order_list_items_list_created
+                    ON order_list_items(list_name, created_at);"""
+                )
+                conn.execute(
                     """INSERT OR IGNORE INTO lists (name, random_enabled, random_count)
                     VALUES (?, 0, 1);""",
                     (DEFAULT_SHOPPING_LIST_NAME,),
@@ -468,6 +511,21 @@ class FlaschenpostSqliteStorage:
                             dep_cents, deliv_cents, status, ostate, raw,
                         ),
                     )
+                    # If this order has no entries in order_list_spends, assign default list attribution
+                    conn.execute(
+                        """INSERT OR IGNORE INTO order_list_spends (
+                            order_id, list_name, goods_cents, deposit_cents,
+                            delivery_fee_cents, total_cents, items_count, created_at
+                        )
+                        SELECT ?, ?, ?, ?, ?, ?, 1, ?
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM order_list_spends WHERE order_id = ?
+                        );""",
+                        (
+                            oid, DEFAULT_SHOPPING_LIST_NAME, goods_cents, dep_cents,
+                            deliv_cents, tot_cents, created, oid,
+                        ),
+                    )
 
         await self._async_run(_record)
 
@@ -504,6 +562,163 @@ class FlaschenpostSqliteStorage:
                     }
                 orders.append(data)
             return orders
+
+        return await self._async_run(_get)
+
+    async def async_set_cart_attributions(
+        self, attributions: dict[int, dict[str, float]], clear_existing: bool = False
+    ) -> None:
+        """Store or update active cart item attributions ({article_id: {list_name: quantity}})."""
+        def _set() -> None:
+            conn = self._get_connection()
+            with conn:
+                if clear_existing:
+                    conn.execute("DELETE FROM cart_item_attributions;")
+                for aid, list_map in attributions.items():
+                    for list_name, qty in list_map.items():
+                        if qty <= 0:
+                            continue
+                        conn.execute(
+                            """INSERT INTO cart_item_attributions (
+                                article_id, list_name, quantity, updated_at
+                            ) VALUES (?, ?, ?, datetime('now'))
+                            ON CONFLICT(article_id, list_name) DO UPDATE SET
+                                quantity = quantity + excluded.quantity,
+                                updated_at = datetime('now');""",
+                            (int(aid), str(list_name), float(qty)),
+                        )
+        await self._async_run(_set)
+
+    async def async_get_cart_attributions(self) -> dict[int, dict[str, float]]:
+        """Return all active cart item attributions as {article_id: {list_name: quantity}}."""
+        def _get() -> dict[int, dict[str, float]]:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT article_id, list_name, quantity FROM cart_item_attributions;")
+            result: dict[int, dict[str, float]] = {}
+            for row in cursor.fetchall():
+                aid = int(row["article_id"])
+                lname = str(row["list_name"])
+                qty = float(row["quantity"])
+                result.setdefault(aid, {})[lname] = qty
+            return result
+        return await self._async_run(_get)
+
+    async def async_clear_cart_attributions(self) -> None:
+        """Clear all active cart item attributions."""
+        def _clear() -> None:
+            conn = self._get_connection()
+            with conn:
+                conn.execute("DELETE FROM cart_item_attributions;")
+        await self._async_run(_clear)
+
+    async def async_record_order_list_spends(
+        self,
+        order_id: str,
+        spends: list[dict[str, Any]],
+        items: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Record per-shopping-list spend breakdown and line items for a placed order."""
+        def _record() -> None:
+            conn = self._get_connection()
+            with conn:
+                conn.execute("DELETE FROM order_list_spends WHERE order_id = ?;", (order_id,))
+                conn.execute("DELETE FROM order_list_items WHERE order_id = ?;", (order_id,))
+
+                for s in spends:
+                    conn.execute(
+                        """INSERT INTO order_list_spends (
+                            order_id, list_name, goods_cents, deposit_cents,
+                            delivery_fee_cents, total_cents, items_count, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);""",
+                        (
+                            order_id,
+                            str(s["list_name"]),
+                            int(s.get("goods_cents", 0)),
+                            int(s.get("deposit_cents", 0)),
+                            int(s.get("delivery_fee_cents", 0)),
+                            int(s.get("total_cents", 0)),
+                            int(s.get("items_count", 0)),
+                            str(s["created_at"]),
+                        ),
+                    )
+
+                if items:
+                    for it in items:
+                        conn.execute(
+                            """INSERT INTO order_list_items (
+                                order_id, list_name, article_id, name,
+                                quantity, total_cents, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?);""",
+                            (
+                                order_id,
+                                str(it["list_name"]),
+                                int(it["article_id"]) if it.get("article_id") else None,
+                                str(it.get("name") or ""),
+                                float(it.get("quantity", 1.0)),
+                                int(it.get("total_cents", 0)),
+                                str(it["created_at"]),
+                            ),
+                        )
+        await self._async_run(_record)
+
+    async def async_get_all_list_spends(self) -> dict[str, list[dict[str, Any]]]:
+        """Return all historical order list spends grouped by list_name."""
+        def _get() -> dict[str, list[dict[str, Any]]]:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT ols.id, ols.order_id, ols.list_name, ols.goods_cents,
+                          ols.deposit_cents, ols.delivery_fee_cents, ols.total_cents,
+                          ols.items_count, ols.created_at,
+                          o.order_state, o.status as order_status
+                   FROM order_list_spends ols
+                   LEFT JOIN orders o ON o.id = ols.order_id
+                   ORDER BY ols.created_at DESC;"""
+            )
+            spends_by_list: dict[str, list[dict[str, Any]]] = {}
+            for row in cursor.fetchall():
+                list_name = str(row["list_name"])
+                spend_entry = {
+                    "id": row["id"],
+                    "order_id": row["order_id"],
+                    "list_name": list_name,
+                    "goods_cents": row["goods_cents"],
+                    "deposit_cents": row["deposit_cents"],
+                    "delivery_fee_cents": row["delivery_fee_cents"],
+                    "total_cents": row["total_cents"],
+                    "items_count": row["items_count"],
+                    "created_at": row["created_at"],
+                    "order_state": row["order_state"],
+                    "order_status": row["order_status"],
+                    "items": [],
+                }
+                spends_by_list.setdefault(list_name, []).append(spend_entry)
+
+            cursor.execute(
+                """SELECT order_id, list_name, article_id, name, quantity, total_cents, created_at
+                   FROM order_list_items
+                   ORDER BY created_at DESC;"""
+            )
+            items_by_order_list: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for irow in cursor.fetchall():
+                key = (str(irow["order_id"]), str(irow["list_name"]))
+                items_by_order_list.setdefault(key, []).append(
+                    {
+                        "article_id": irow["article_id"],
+                        "name": irow["name"],
+                        "quantity": irow["quantity"],
+                        "total_cents": irow["total_cents"],
+                        "total_eur": round(irow["total_cents"] / 100.0, 2),
+                        "created_at": irow["created_at"],
+                    }
+                )
+
+            for list_name, spend_list in spends_by_list.items():
+                for s in spend_list:
+                    s["items"] = items_by_order_list.get((s["order_id"], list_name), [])
+
+            return spends_by_list
 
         return await self._async_run(_get)
 

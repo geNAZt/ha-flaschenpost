@@ -203,6 +203,18 @@
       },
       "total_spent": {
         "name": "Total spent"
+      },
+      "list_weekly_spent": {
+        "name": "{list_name} spent this week"
+      },
+      "list_monthly_spent": {
+        "name": "{list_name} spent this month"
+      },
+      "list_yearly_spent": {
+        "name": "{list_name} spent this year"
+      },
+      "list_total_spent": {
+        "name": "{list_name} total spent"
       }
     },
     "binary_sensor": {

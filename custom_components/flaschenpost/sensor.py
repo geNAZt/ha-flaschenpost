@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -100,6 +101,60 @@ def _filter_and_aggregate_orders(
     }
 
 
+def _filter_and_aggregate_list_spends(
+    spends: list[dict[str, Any]],
+    since: datetime | None = None,
+) -> dict[str, Any]:
+    """Aggregate per-list spending records filtering out cancelled orders and out-of-range dates."""
+    valid_spends: list[dict[str, Any]] = []
+    total_cents = 0
+    goods_cents = 0
+    deposit_cents = 0
+    delivery_fee_cents = 0
+    item_count = 0
+    all_items: list[dict[str, Any]] = []
+
+    for s in spends:
+        if not isinstance(s, dict):
+            continue
+        order_state = str(s.get("order_state") or "")
+        order_status = str(s.get("order_status") or "")
+        if order_state.lower() == "cancelled" or order_status.lower() in ("cancelled", "storniert"):
+            continue
+
+        created_str = s.get("created_at")
+        if created_str:
+            try:
+                created = dt_util.parse_datetime(created_str)
+                if created and since and dt_util.as_local(created) < since:
+                    continue
+            except Exception:
+                pass
+        elif since:
+            continue
+
+        valid_spends.append(s)
+        total_cents += int(s.get("total_cents") or 0)
+        goods_cents += int(s.get("goods_cents") or 0)
+        deposit_cents += int(s.get("deposit_cents") or 0)
+        delivery_fee_cents += int(s.get("delivery_fee_cents") or 0)
+        item_count += int(s.get("items_count") or 0)
+        for it in s.get("items") or []:
+            all_items.append(it)
+
+    return {
+        "order_count": len(valid_spends),
+        "item_count": item_count,
+        "total_eur": round(total_cents / 100.0, 2),
+        "goods_eur": round(goods_cents / 100.0, 2),
+        "deposit_eur": round(deposit_cents / 100.0, 2),
+        "delivery_fee_eur": round(delivery_fee_cents / 100.0, 2),
+        "first_order_date": valid_spends[-1]["created_at"] if valid_spends else None,
+        "last_order_date": valid_spends[0]["created_at"] if valid_spends else None,
+        "items": all_items[:15],
+    }
+
+
 def _summarize_order(order: dict[str, Any]) -> dict[str, Any]:
     """Build compact HA attribute summary for an order object."""
     custom_fields = (order.get("custom") or {}).get("fields") or {}
@@ -171,6 +226,36 @@ async def async_setup_entry(
             FlaschenpostTotalSpentSensor(coordinator),
         ]
     )
+
+    added_list_keys: set[str] = set()
+
+    def _add_list_sensors() -> None:
+        if not hasattr(coordinator, "shopping_list") or not coordinator.shopping_list:
+            return
+        new_entities: list[SensorEntity] = []
+        for list_name in coordinator.shopping_list.list_names:
+            norm_name = list_name.strip()
+            if not norm_name or norm_name in added_list_keys:
+                continue
+            added_list_keys.add(norm_name)
+            new_entities.extend(
+                [
+                    FlaschenpostListWeeklySpentSensor(coordinator, norm_name),
+                    FlaschenpostListMonthlySpentSensor(coordinator, norm_name),
+                    FlaschenpostListYearlySpentSensor(coordinator, norm_name),
+                    FlaschenpostListTotalSpentSensor(coordinator, norm_name),
+                ]
+            )
+        if new_entities:
+            async_add_entities(new_entities)
+
+    _add_list_sensors()
+    if hasattr(coordinator, "shopping_list") and hasattr(coordinator.shopping_list, "register_list_added_callback"):
+        coordinator.shopping_list.register_list_added_callback(lambda _: _add_list_sensors())
+    if hasattr(coordinator, "async_add_listener"):
+        unsub = coordinator.async_add_listener(_add_list_sensors)
+        if hasattr(entry, "async_on_unload"):
+            entry.async_on_unload(unsub)
 
 
 class FlaschenpostOrderStatusSensor(FlaschenpostEntity, SensorEntity):
@@ -680,4 +765,104 @@ class FlaschenpostTotalSpentSensor(FlaschenpostEntity, SensorEntity):
             }
         )
         return attrs
+
+
+class _FlaschenpostBaseListSpentSensor(FlaschenpostEntity, SensorEntity):
+    """Base class for per-shopping-list spending summary sensors."""
+
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_native_unit_of_measurement = CURRENCY_EURO
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(
+        self,
+        coordinator: FlaschenpostCoordinator,
+        list_name: str,
+        period_key: str,
+        icon: str,
+    ) -> None:
+        self._list_name = list_name
+        self._period_key = period_key
+        self._attr_icon = icon
+        slug = re.sub(r"[^a-zA-Z0-9_-]", "_", list_name.lower()).strip("_")
+        super().__init__(coordinator, f"list_{slug}_{period_key}")
+        self._attr_translation_key = f"list_{period_key}"
+        self._attr_translation_placeholders = {"list_name": list_name}
+        self._attr_name = f"{list_name} {period_key.replace('_', ' ').capitalize()}"
+
+    def _get_list_spends(self) -> list[dict[str, Any]]:
+        snap = self.coordinator.data
+        if not snap or not hasattr(snap, "list_spends"):
+            return []
+        return snap.list_spends.get(self._list_name, [])
+
+    def _get_since(self) -> datetime | None:
+        now = dt_util.now()
+        if self._period_key == "weekly_spent":
+            start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            return start_of_day - timedelta(days=now.weekday())
+        if self._period_key == "monthly_spent":
+            return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if self._period_key == "yearly_spent":
+            return now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        return None
+
+    @property
+    def native_value(self) -> float:
+        spends = self._get_list_spends()
+        since = self._get_since()
+        agg = _filter_and_aggregate_list_spends(spends, since=since)
+        return float(agg["total_eur"])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs = _freshness_attrs(self.coordinator)
+        spends = self._get_list_spends()
+        since = self._get_since()
+        agg = _filter_and_aggregate_list_spends(spends, since=since)
+        attrs.update(
+            {
+                "list_name": self._list_name,
+                "order_count": agg["order_count"],
+                "item_count": agg["item_count"],
+                "goods_eur": agg["goods_eur"],
+                "deposit_eur": agg["deposit_eur"],
+                "delivery_fee_eur": agg["delivery_fee_eur"],
+                "recent_items": agg["items"],
+            }
+        )
+        if since:
+            attrs[f"{self._period_key.split('_')[0]}_start"] = since.isoformat()
+        if self._period_key == "total_spent":
+            attrs["first_order_date"] = agg["first_order_date"]
+            attrs["last_order_date"] = agg["last_order_date"]
+        return attrs
+
+
+class FlaschenpostListWeeklySpentSensor(_FlaschenpostBaseListSpentSensor):
+    """Weekly spending summary sensor for a specific shopping list."""
+
+    def __init__(self, coordinator: FlaschenpostCoordinator, list_name: str) -> None:
+        super().__init__(coordinator, list_name, "weekly_spent", "mdi:calendar-week")
+
+
+class FlaschenpostListMonthlySpentSensor(_FlaschenpostBaseListSpentSensor):
+    """Monthly spending summary sensor for a specific shopping list."""
+
+    def __init__(self, coordinator: FlaschenpostCoordinator, list_name: str) -> None:
+        super().__init__(coordinator, list_name, "monthly_spent", "mdi:calendar-month")
+
+
+class FlaschenpostListYearlySpentSensor(_FlaschenpostBaseListSpentSensor):
+    """Yearly spending summary sensor for a specific shopping list."""
+
+    def __init__(self, coordinator: FlaschenpostCoordinator, list_name: str) -> None:
+        super().__init__(coordinator, list_name, "yearly_spent", "mdi:calendar-range")
+
+
+class FlaschenpostListTotalSpentSensor(_FlaschenpostBaseListSpentSensor):
+    """All-time non-resetting total spending summary sensor for a specific shopping list."""
+
+    def __init__(self, coordinator: FlaschenpostCoordinator, list_name: str) -> None:
+        super().__init__(coordinator, list_name, "total_spent", "mdi:cash-multiple")
 

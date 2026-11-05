@@ -197,11 +197,16 @@ from custom_components.flaschenpost.coordinator import (
 from custom_components.flaschenpost.sensor import (
     FlaschenpostCartTotalSensor,
     FlaschenpostLastUpdateSensor,
+    FlaschenpostListMonthlySpentSensor,
+    FlaschenpostListTotalSpentSensor,
+    FlaschenpostListWeeklySpentSensor,
+    FlaschenpostListYearlySpentSensor,
     FlaschenpostMonthlySpentSensor,
     FlaschenpostNextUpdateSensor,
     FlaschenpostTotalSpentSensor,
     FlaschenpostWeeklySpentSensor,
     FlaschenpostYearlySpentSensor,
+    async_setup_entry as async_setup_sensor_entry,
 )
 from custom_components.flaschenpost.shopping_list import (
     DEFAULT_ITEM_WEIGHT,
@@ -2988,6 +2993,227 @@ class TestFlaschenpostHelpers(unittest.TestCase):
                 self.assertEqual(monthly_sensor.native_value, 0.0)
                 self.assertEqual(yearly_sensor.native_value, 0.0)
                 self.assertEqual(total_sensor.native_value, 0.0)
+
+                storage.close()
+
+        asyncio.run(_run())
+
+    def test_per_shopping_list_spending_summary_sensors(self) -> None:
+        """Verify per-shopping-list spending summary sensors (weekly, monthly, yearly, total) and merged cart attribution."""
+        import tempfile
+
+        async def _run() -> None:
+            fake_client = _FakeApiClient()
+            mock_entry = types.SimpleNamespace(entry_id="test_entry", title="Test Account")
+            mock_hass = types.SimpleNamespace(data={"flaschenpost": {}})
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = Path(tmp_dir) / "flaschenpost.db"
+                storage = FlaschenpostSqliteStorage(str(db_path))
+                await storage.async_init()
+                mgr = FlaschenpostShoppingListManager(client=fake_client, storage=storage)
+
+                # 1. Create two lists and populate items
+                await mgr.async_load()
+
+                # Add items to "Weekly Grocery"
+                # "1x Heidelbeeren" (art 29010 @ 2.29 EUR)
+                # "2x Joghurt" (art 28435 @ 0.79 EUR = 1.58 EUR)
+                await mgr.async_add_item("1x Heidelbeeren", list_name="Weekly Grocery")
+                await mgr.async_add_item("2x Joghurt", list_name="Weekly Grocery")
+
+                # Add items to "Office Drinks"
+                # "1x Pepsi Zero" (crate, art 1838 @ 15.99 EUR)
+                # "1x Joghurt" (merged with Weekly Grocery: art 28435 @ 0.79 EUR)
+                await mgr.async_add_item("1 Kiste Pepsi Zero", list_name="Office Drinks")
+                await mgr.async_add_item("1x Joghurt", list_name="Office Drinks")
+
+                # 2. Sync both lists to cart (merged)
+                sync_res = await mgr.async_add_lists_to_cart(
+                    list_names=["Weekly Grocery", "Office Drinks"],
+                    clear_cart_first=True,
+                )
+                self.assertEqual(sync_res["synced_count"], 3)  # Heidelbeeren, Joghurt (merged), Pepsi Zero
+
+                # 3. Check SQLite cart attributions
+                cart_attrs = await storage.async_get_cart_attributions()
+                # 28435 (Joghurt) was requested by both lists: 2.0 by Weekly Grocery, 1.0 by Office Drinks
+                self.assertIn(28435, cart_attrs)
+                self.assertAlmostEqual(cart_attrs[28435]["Weekly Grocery"], 2.0)
+                self.assertAlmostEqual(cart_attrs[28435]["Office Drinks"], 1.0)
+                # 29010 (Heidelbeeren) only Weekly Grocery
+                self.assertIn(29010, cart_attrs)
+                self.assertAlmostEqual(cart_attrs[29010]["Weekly Grocery"], 1.0)
+                # 1838 (Pepsi Zero) only Office Drinks
+                self.assertIn(1838, cart_attrs)
+                self.assertAlmostEqual(cart_attrs[1838]["Office Drinks"], 1.0)
+
+                # 4. Simulate placing order
+                # Total goods: 229 (Heidelbeeren) + 237 (3x Joghurt) + 1599 (Pepsi Zero) = 2065 cents (20.65 EUR)
+                # Total deposit: 310 cents (3.10 EUR)
+                # Delivery fee: 0 cents
+                # Total price: 2375 cents (23.75 EUR)
+                order_placed = {
+                    "id": "ord-merged-001",
+                    "orderNumber": "ORD-001",
+                    "createdAt": "2026-11-03T12:00:00Z",  # This week (Wednesday is 2026-11-04)
+                    "totalPrice": {"centAmount": 2375},
+                    "custom": {
+                        "fields": {
+                            "TotalGoods": {"centAmount": 2065},
+                            "TotalDeposit": {"centAmount": 310},
+                            "TotalDelivery": {"centAmount": 0},
+                            "OfficialStatusIconState": "delivered",
+                        }
+                    },
+                    "orderState": "Complete",
+                    "lineItems": [
+                        {
+                            "id": "li-1",
+                            "variant": {"sku": "29010"},
+                            "name": {"de-DE": "K-Classic Heidelbeeren gezuckert"},
+                            "quantity": 1,
+                            "totalPrice": {"centAmount": 229},
+                        },
+                        {
+                            "id": "li-2",
+                            "variant": {"sku": "28435"},
+                            "name": {"de-DE": "K-Classic Naturjoghurt 1,5%"},
+                            "quantity": 3,
+                            "totalPrice": {"centAmount": 237},
+                        },
+                        {
+                            "id": "li-3",
+                            "variant": {"sku": "1838"},
+                            "name": {"de-DE": "Pepsi Zero Kiste"},
+                            "quantity": 1,
+                            "totalPrice": {"centAmount": 1599},
+                        },
+                    ],
+                }
+
+                await mgr.async_record_order_attributions(order_placed)
+
+                # Cart attributions must be cleared after order
+                cleared_attrs = await storage.async_get_cart_attributions()
+                self.assertEqual(len(cleared_attrs), 0)
+
+                # 5. Check order list spends in storage
+                all_spends = await storage.async_get_all_list_spends()
+                self.assertIn("Weekly Grocery", all_spends)
+                self.assertIn("Office Drinks", all_spends)
+
+                wg_spend = all_spends["Weekly Grocery"][0]
+                od_spend = all_spends["Office Drinks"][0]
+
+                # Weekly Grocery: 229 + 158 = 387 cents goods, 58 cents deposit -> 445 cents total (4.45 EUR)
+                self.assertEqual(wg_spend["goods_cents"], 387)
+                self.assertEqual(wg_spend["deposit_cents"], 58)
+                self.assertEqual(wg_spend["total_cents"], 445)
+                self.assertEqual(wg_spend["items_count"], 2)
+
+                # Office Drinks: 1599 + 79 = 1678 cents goods, 252 cents deposit -> 1930 cents total (19.30 EUR)
+                self.assertEqual(od_spend["goods_cents"], 1678)
+                self.assertEqual(od_spend["deposit_cents"], 252)
+                self.assertEqual(od_spend["total_cents"], 1930)
+                self.assertEqual(od_spend["items_count"], 2)
+
+                # Combined total matches order totalPrice exactly
+                self.assertEqual(wg_spend["total_cents"] + od_spend["total_cents"], 2375)
+
+                # 6. Setup coordinator & sensors
+                coord = FlaschenpostCoordinator(
+                    hass=mock_hass,  # type: ignore[arg-type]
+                    entry=mock_entry,  # type: ignore[arg-type]
+                    client=fake_client,  # type: ignore[arg-type]
+                    shopping_list=mgr,
+                )
+                coord.data = FlaschenpostSnapshot(
+                    list_spends=all_spends,
+                    all_orders=[order_placed],
+                )
+
+                wg_weekly = FlaschenpostListWeeklySpentSensor(coord, "Weekly Grocery")
+                wg_monthly = FlaschenpostListMonthlySpentSensor(coord, "Weekly Grocery")
+                wg_yearly = FlaschenpostListYearlySpentSensor(coord, "Weekly Grocery")
+                wg_total = FlaschenpostListTotalSpentSensor(coord, "Weekly Grocery")
+
+                od_weekly = FlaschenpostListWeeklySpentSensor(coord, "Office Drinks")
+                od_monthly = FlaschenpostListMonthlySpentSensor(coord, "Office Drinks")
+                od_yearly = FlaschenpostListYearlySpentSensor(coord, "Office Drinks")
+                od_total = FlaschenpostListTotalSpentSensor(coord, "Office Drinks")
+
+                self.assertEqual(wg_weekly.native_value, 4.45)
+                self.assertEqual(wg_monthly.native_value, 4.45)
+                self.assertEqual(wg_yearly.native_value, 4.45)
+                self.assertEqual(wg_total.native_value, 4.45)
+
+                self.assertEqual(od_weekly.native_value, 19.30)
+                self.assertEqual(od_monthly.native_value, 19.30)
+                self.assertEqual(od_yearly.native_value, 19.30)
+                self.assertEqual(od_total.native_value, 19.30)
+
+                wg_attrs = wg_weekly.extra_state_attributes
+                self.assertEqual(wg_attrs["list_name"], "Weekly Grocery")
+                self.assertEqual(wg_attrs["order_count"], 1)
+                self.assertEqual(wg_attrs["item_count"], 2)
+                self.assertEqual(wg_attrs["goods_eur"], 3.87)
+                self.assertEqual(wg_attrs["deposit_eur"], 0.58)
+                self.assertEqual(wg_attrs["delivery_fee_eur"], 0.0)
+                self.assertEqual(len(wg_attrs["recent_items"]), 2)
+
+                # 7. Test cancelled order exclusion
+                cancelled_order = {
+                    "id": "ord-cancelled-999",
+                    "orderNumber": "ORD-999",
+                    "createdAt": "2026-11-03T14:00:00Z",
+                    "totalPrice": {"centAmount": 5000},
+                    "custom": {
+                        "fields": {
+                            "TotalGoods": {"centAmount": 5000},
+                            "OfficialStatusIconState": "cancelled",
+                        }
+                    },
+                    "orderState": "Cancelled",
+                    "lineItems": [
+                        {
+                            "id": "li-c",
+                            "variant": {"sku": "29010"},
+                            "name": {"de-DE": "K-Classic Heidelbeeren"},
+                            "quantity": 1,
+                            "totalPrice": {"centAmount": 5000},
+                        }
+                    ],
+                }
+                await storage.async_set_cart_attributions({29010: {"Weekly Grocery": 1.0}})
+                await mgr.async_record_order_attributions(cancelled_order)
+
+                await storage.async_record_orders([order_placed, cancelled_order])
+                all_spends_with_cancelled = await storage.async_get_all_list_spends()
+                coord.data = FlaschenpostSnapshot(
+                    list_spends=all_spends_with_cancelled,
+                    all_orders=[order_placed, cancelled_order],
+                )
+
+                self.assertEqual(wg_weekly.native_value, 4.45)
+                self.assertEqual(wg_total.native_value, 4.45)
+
+                # 8. Test dynamic sensor registration via async_setup_sensor_entry
+                mock_hass.data["flaschenpost"]["test_entry"] = coord
+                added_entities: list[Any] = []
+                await async_setup_sensor_entry(
+                    mock_hass,  # type: ignore[arg-type]
+                    mock_entry,  # type: ignore[arg-type]
+                    lambda entities: added_entities.extend(entities),
+                )
+                entity_keys = [getattr(e, "_period_key", None) for e in added_entities]
+                self.assertIn("weekly_spent", entity_keys)
+                self.assertIn("monthly_spent", entity_keys)
+                self.assertIn("yearly_spent", entity_keys)
+                self.assertIn("total_spent", entity_keys)
+                list_sensor_names = [getattr(e, "_list_name", None) for e in added_entities]
+                self.assertIn("Weekly Grocery", list_sensor_names)
+                self.assertIn("Office Drinks", list_sensor_names)
 
                 storage.close()
 
