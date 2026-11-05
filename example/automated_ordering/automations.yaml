@@ -1,0 +1,94 @@
+# ==============================================================================
+# Flaschenpost: Automated Cart Ordering Examples
+# ==============================================================================
+
+# Example 1: Full automated order placement with delivery slot selection
+- id: flaschenpost_auto_place_order
+  alias: "Flaschenpost: Automated order placement"
+  description: "Selects preferred delivery slot and places order when cart reaches minimum threshold"
+  trigger:
+    - trigger: time
+      at: "20:00:00"
+  condition:
+    # 1. Only order on specific shopping days (e.g. Thursday evening)
+    - condition: time
+      weekday:
+        - thu
+    # 2. Safety check: ensure cart has items and meets minimum order value (e.g. 29 €)
+    - condition: numeric_state
+      entity_id: sensor.flaschenpost_cart_total
+      above: 25.0
+    # 3. Ensure no delivery is already in progress
+    - condition: state
+      entity_id: sensor.flaschenpost_order_status
+      state: "idle"
+  action:
+    # Optional: Select delivery slot if available
+    - action: flaschenpost.select_delivery_slot
+      data:
+        slot_type: "Standard"
+
+    # Place order (confirm: true is required as safety verification)
+    - action: flaschenpost.place_order
+      data:
+        confirm: true
+        # Payment method configured in integration settings (or specify CreditCard / SepaDirectDebit)
+      response_variable: order_result
+
+    # Send push notification with order confirmation and delivery tracking
+    - action: notify.notify
+      data:
+        title: "📦 Flaschenpost Bestellung aufgegeben!"
+        message: >
+          Bestellnummer: {{ order_result.order_number }}
+          Warenkorb: {{ states('sensor.flaschenpost_cart_total') }} €
+          Status: In Vorbereitung
+        data:
+          url: "/flaschenpost"
+  mode: single
+
+# Example 2: Interactive 1-tap confirmation notification (semi-automated)
+# Triggers notification when cart hits free delivery threshold, then orders on button click
+- id: flaschenpost_notify_ready_to_order
+  alias: "Flaschenpost: Push confirmation when cart is full"
+  description: "Sends actionable mobile notification when cart is ready to order"
+  trigger:
+    - trigger: numeric_state
+      entity_id: sensor.flaschenpost_cart_total
+      above: 29.0
+  condition:
+    - condition: state
+      entity_id: sensor.flaschenpost_order_status
+      state: "idle"
+  action:
+    - action: notify.notify
+      data:
+        title: "🛒 Flaschenpost: Warenkorb ist voll"
+        message: "Der Warenkorb liegt bei {{ states('sensor.flaschenpost_cart_total') }} € (Mindestbestellwert erreicht)."
+        data:
+          actions:
+            - action: "FLASCHENPOST_ORDER_NOW"
+              title: "✅ Jetzt bestellen"
+            - action: "FLASCHENPOST_DISMISS"
+              title: "Später"
+
+- id: flaschenpost_handle_actionable_notification
+  alias: "Flaschenpost: Place order from actionable notification"
+  description: "Places order when user taps 'Jetzt bestellen' on mobile notification"
+  trigger:
+    - trigger: event
+      event_type: mobile_app_notification_action
+      event_data:
+        action: "FLASCHENPOST_ORDER_NOW"
+  condition:
+    - condition: numeric_state
+      entity_id: sensor.flaschenpost_cart_total
+      above: 25.0
+  action:
+    - action: flaschenpost.place_order
+      data:
+        confirm: true
+    - action: notify.notify
+      data:
+        title: "✅ Flaschenpost bestellt"
+        message: "Deine Bestellung wurde erfolgreich übertragen!"

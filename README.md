@@ -97,7 +97,9 @@ data:
 
 ## Automation Examples
 
-- **[Bring! <-> Flaschenpost Bi-Directional Sync](./example/bring_sync/README.md)**: Automatically sync items from a Bring! to-do list into a Flaschenpost shopping list, and automatically mark them as completed in Bring! when the Flaschenpost order is placed.
+- **[Bring! <-> Flaschenpost Bi-Directional Sync](./example/bring_sync/README.md)**: Automatically sync items from a Bring! to-do list into a Flaschenpost shopping list (with amount and unit parsing), and automatically mark them as completed in Bring! when the Flaschenpost order is placed.
+- **[Automated Cart Filling](./example/automated_cart_filling/README.md)**: Automatically merge multiple shopping lists into the cart on a recurring schedule with smart sorting algorithms (cheapest price, price per kg/liter) and out-of-stock reporting.
+- **[Automated Cart Ordering](./example/automated_ordering/README.md)**: Automatically select delivery slots and place paid orders with safety thresholds (), or trigger 1-tap actionable mobile approval notifications.
 
 ## Installation via HACS
 

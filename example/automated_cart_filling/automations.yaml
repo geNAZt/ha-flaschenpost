@@ -1,0 +1,65 @@
+# ==============================================================================
+# Flaschenpost: Automated Cart Filling Examples
+# ==============================================================================
+
+# Example 1: Scheduled weekly cart filling merging multiple lists
+- id: flaschenpost_weekly_cart_fill
+  alias: "Flaschenpost: Weekly cart filling"
+  description: "Clears cart and populates it with items from multiple shopping lists every Thursday at 18:00"
+  trigger:
+    - trigger: time
+      at: "18:00:00"
+  condition:
+    - condition: time
+      weekday:
+        - thu
+  action:
+    # 1. Merge standard lists, alternating week list, and external Bring to-do list
+    - action: flaschenpost.add_shopping_lists_to_cart
+      data:
+        clear_cart_first: true
+        mark_completed: false
+        default_sort_by: price
+        shopping_lists:
+          - "Grundvorräte"
+          - "Getränke"
+          - "Bring"
+          # Alternating even/odd week dinner plan lists
+          - "{{ 'Gerichte Gerade Woche' if (now().isocalendar()[1] % 2 == 0) else 'Gerichte Ungerade Woche' }}"
+      response_variable: cart_result
+
+    # 2. Send actionable mobile notification with summary
+    - action: notify.notify
+      data:
+        title: "🛒 Flaschenpost Warenkorb befüllt"
+        message: >
+          {{ cart_result.synced_count }} Artikel hinzugefügt.
+          {% if cart_result.unresolved | length > 0 %}
+          ⚠️ Nicht vorrätig: {{ cart_result.unresolved | join(', ') }}
+          {% endif %}
+          Gesamtsumme: {{ states('sensor.flaschenpost_cart_total') }} €
+        data:
+          url: "/flaschenpost"
+          actions:
+            - action: "URI"
+              title: "Warenkorb ansehen"
+              uri: "/flaschenpost"
+  mode: single
+
+# Example 2: Fill cart on demand when button / NFC tag is pressed
+- id: flaschenpost_fill_cart_on_demand
+  alias: "Flaschenpost: Quick cart replenishment from snacks & drinks"
+  description: "Appends office snacks and beverages without clearing existing cart contents"
+  trigger:
+    - trigger: state
+      entity_id: input_button.flaschenpost_quick_fill
+  action:
+    - action: flaschenpost.add_shopping_lists_to_cart
+      data:
+        clear_cart_first: false
+        mark_completed: false
+        default_sort_by: price_per_liter
+        shopping_lists:
+          - "Getränke"
+          - "Snacks"
+  mode: single
