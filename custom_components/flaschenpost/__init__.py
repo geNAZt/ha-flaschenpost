@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -32,11 +33,14 @@ from .const import (
     ORIGIN_REORDER,
     ORIGIN_SEARCH,
     PAYMENT_CREDIT_CARD,
+    SERVICE_ADD_COUPON,
     SERVICE_ADD_LISTS_TO_CART,
     SERVICE_ADD_TO_CART,
     SERVICE_CREATE_NEW_CART,
+    SERVICE_DELETE_COUPON,
     SERVICE_DELETE_SHOPPING_LIST,
     SERVICE_GET_CATEGORIES,
+    SERVICE_GET_COUPONS,
     SERVICE_GET_FAVORITES,
     SERVICE_GET_PAYMENT_METHODS,
     SERVICE_GET_SHOPPING_LISTS,
@@ -195,7 +199,7 @@ async def _async_fetch_external_ha_todo_items(
 
 PANEL_URL_PATH = "flaschenpost"
 FRONTEND_URL = "/flaschenpost_static"
-PANEL_JS_VERSION = "2.0.9"
+PANEL_JS_VERSION = "2.1.0"
 
 
 async def _async_register_frontend_panel(hass: HomeAssistant) -> None:
@@ -673,6 +677,11 @@ def _async_register_services(hass: HomeAssistant) -> None:
             or coord.config_entry.data.get(CONF_IBAN_LAST4)
             or None
         )
+        # Check and apply next active coupon code from DB
+        applied_coupon = None
+        if hasattr(coord, "shopping_list") and coord.shopping_list:
+            applied_coupon = await coord.shopping_list.async_apply_next_coupon_to_cart()
+
         try:
             order = await coord.client.async_place_order(
                 payment_method=payment_method,
@@ -684,11 +693,41 @@ def _async_register_services(hass: HomeAssistant) -> None:
         except FlaschenpostError as err:
             raise HomeAssistantError(str(err)) from err
 
+        if applied_coupon and hasattr(coord, "shopping_list") and coord.shopping_list:
+            order_ref = str(order.get("id") or order.get("orderNumber") or "")
+            await coord.shopping_list.async_mark_coupon_used(applied_coupon["code"], order_ref)
+
         await coord.async_request_refresh()
         return {
             "order_id": order.get("id"),
             "order_number": order.get("orderNumber"),
+            "applied_coupon": applied_coupon["code"] if applied_coupon else None,
         }
+
+    async def handle_add_coupon(call: ServiceCall) -> ServiceResponse:
+        """Add or reactivate a coupon code in the database."""
+        coord = _resolve_coordinator(hass, call.data.get("config_entry_id"))
+        code = str(call.data["code"]).strip()
+        desc = str(call.data.get("description") or "").strip()
+        coupon = await coord.shopping_list.async_add_coupon(code=code, description=desc)
+        with contextlib.suppress(Exception):
+            await coord.client.async_add_discount_code(code)
+            await coord.async_request_refresh()
+        return coupon
+
+    async def handle_get_coupons(call: ServiceCall) -> ServiceResponse:
+        """Fetch saved coupons from database."""
+        coord = _resolve_coordinator(hass, call.data.get("config_entry_id"))
+        status = call.data.get("status")
+        coupons = await coord.shopping_list.async_get_coupons(status=status)
+        return {"coupons": coupons}
+
+    async def handle_delete_coupon(call: ServiceCall) -> ServiceResponse:
+        """Delete a saved coupon code from the database."""
+        coord = _resolve_coordinator(hass, call.data.get("config_entry_id"))
+        code = str(call.data["code"]).strip()
+        deleted = await coord.shopping_list.async_delete_coupon(code)
+        return {"code": code, "deleted": deleted}
 
     hass.services.async_register(
         DOMAIN,
@@ -936,5 +975,45 @@ def _async_register_services(hass: HomeAssistant) -> None:
         SERVICE_PLACE_ORDER,
         handle_place_order,
         schema=order_schema,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_ADD_COUPON,
+        handle_add_coupon,
+        schema=vol.Schema(
+            {
+                vol.Optional("config_entry_id"): cv.string,
+                vol.Required("code"): cv.string,
+                vol.Optional("description", default=""): cv.string,
+            }
+        ),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_GET_COUPONS,
+        handle_get_coupons,
+        schema=vol.Schema(
+            {
+                vol.Optional("config_entry_id"): cv.string,
+                vol.Optional("status"): cv.string,
+            }
+        ),
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_DELETE_COUPON,
+        handle_delete_coupon,
+        schema=vol.Schema(
+            {
+                vol.Optional("config_entry_id"): cv.string,
+                vol.Required("code"): cv.string,
+            }
+        ),
         supports_response=SupportsResponse.OPTIONAL,
     )

@@ -99,6 +99,9 @@ SERVICE_GET_STORED_PAYMENT_ID = "get_stored_payment_id"
 SERVICE_GET_PAYMENT_METHODS = "get_payment_methods"
 SERVICE_IMPORT_CART_TO_LIST = "import_cart_to_list"
 SERVICE_SET_LIST_CONFIG = "set_shopping_list_config"
+SERVICE_ADD_COUPON = "add_coupon"
+SERVICE_GET_COUPONS = "get_coupons"
+SERVICE_DELETE_COUPON = "delete_coupon"
 
 DEFAULT_ITEM_WEIGHT: float = 1.0
 

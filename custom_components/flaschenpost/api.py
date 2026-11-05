@@ -1157,6 +1157,29 @@ class FlaschenpostApiClient:
             [{"action": "removeLineItem", "lineItemId": line_item_id}]
         )
 
+    async def async_add_discount_code(self, code: str) -> dict[str, Any]:
+        """Apply a coupon or discount code to the cart (`POST /cart` action `addDiscountCode`)."""
+        cleaned = code.strip()
+        if not cleaned:
+            raise FlaschenpostError("Discount code cannot be empty")
+        return await self.async_apply_cart_actions(
+            [{"action": "addDiscountCode", "code": cleaned}]
+        )
+
+    async def async_remove_discount_code(self, discount_code_id: str) -> dict[str, Any]:
+        """Remove a discount code from the cart."""
+        return await self.async_apply_cart_actions(
+            [
+                {
+                    "action": "removeDiscountCode",
+                    "discountCode": {
+                        "id": discount_code_id,
+                        "typeId": "discount-code",
+                    },
+                }
+            ]
+        )
+
     async def async_get_delivery_slots(
         self,
         cart: dict[str, Any] | None = None,

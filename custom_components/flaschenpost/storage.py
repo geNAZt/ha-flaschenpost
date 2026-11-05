@@ -123,6 +123,22 @@ class FlaschenpostSqliteStorage:
                     );"""
                 )
                 conn.execute(
+                    """CREATE TABLE IF NOT EXISTS coupons (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        code TEXT UNIQUE NOT NULL,
+                        description TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT 'active',
+                        used_at TEXT,
+                        order_id TEXT,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    );"""
+                )
+                conn.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_coupons_status
+                    ON coupons(status, created_at);"""
+                )
+                conn.execute(
                     """INSERT OR IGNORE INTO lists (name, random_enabled, random_count)
                     VALUES (?, 0, 1);""",
                     (DEFAULT_SHOPPING_LIST_NAME,),
@@ -268,6 +284,121 @@ class FlaschenpostSqliteStorage:
                     conn.execute("DELETE FROM lists WHERE name = ?;", (list_name,))
 
         await self._async_run(_del)
+
+    async def async_get_coupons(self, status: str | None = None) -> list[dict[str, Any]]:
+        """Return all coupons or coupons filtered by status ('active', 'used', etc.)."""
+        def _get() -> list[dict[str, Any]]:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            if status:
+                cursor.execute(
+                    """SELECT id, code, description, status, used_at, order_id, created_at, updated_at
+                       FROM coupons
+                       WHERE status = ?
+                       ORDER BY id ASC;""",
+                    (status,),
+                )
+            else:
+                cursor.execute(
+                    """SELECT id, code, description, status, used_at, order_id, created_at, updated_at
+                       FROM coupons
+                       ORDER BY id ASC;"""
+                )
+            results = []
+            for row in cursor.fetchall():
+                results.append(
+                    {
+                        "id": int(row["id"]),
+                        "code": str(row["code"]),
+                        "description": str(row["description"] or ""),
+                        "status": str(row["status"]),
+                        "used_at": row["used_at"],
+                        "order_id": row["order_id"],
+                        "created_at": row["created_at"],
+                        "updated_at": row["updated_at"],
+                    }
+                )
+            return results
+
+        return await self._async_run(_get)
+
+    async def async_get_active_coupons(self) -> list[dict[str, Any]]:
+        """Return all active/unused coupons ordered by creation date."""
+        return await self.async_get_coupons(status="active")
+
+    async def async_add_coupon(self, code: str, description: str = "") -> dict[str, Any]:
+        """Add or reactivate a coupon code in SQLite."""
+        cleaned_code = code.strip().upper()
+        if not cleaned_code:
+            raise ValueError("Coupon code cannot be empty")
+
+        def _add() -> dict[str, Any]:
+            conn = self._get_connection()
+            with conn:
+                conn.execute(
+                    """INSERT INTO coupons (code, description, status, created_at, updated_at)
+                       VALUES (?, ?, 'active', datetime('now'), datetime('now'))
+                       ON CONFLICT(code) DO UPDATE SET
+                           description = CASE WHEN excluded.description != '' THEN excluded.description ELSE coupons.description END,
+                           status = 'active',
+                           used_at = NULL,
+                           order_id = NULL,
+                           updated_at = datetime('now');""",
+                    (cleaned_code, description.strip()),
+                )
+                cursor = conn.cursor()
+                cursor.execute(
+                    """SELECT id, code, description, status, used_at, order_id, created_at, updated_at
+                       FROM coupons WHERE code = ?;""",
+                    (cleaned_code,),
+                )
+                row = cursor.fetchone()
+                return {
+                    "id": int(row["id"]),
+                    "code": str(row["code"]),
+                    "description": str(row["description"] or ""),
+                    "status": str(row["status"]),
+                    "used_at": row["used_at"],
+                    "order_id": row["order_id"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+
+        return await self._async_run(_add)
+
+    async def async_delete_coupon(self, code_or_id: str | int) -> bool:
+        """Delete a coupon from SQLite by ID or code string."""
+        def _del() -> bool:
+            conn = self._get_connection()
+            with conn:
+                cursor = conn.cursor()
+                if isinstance(code_or_id, int) or (isinstance(code_or_id, str) and code_or_id.isdigit()):
+                    cursor.execute("DELETE FROM coupons WHERE id = ?;", (int(code_or_id),))
+                else:
+                    cursor.execute("DELETE FROM coupons WHERE UPPER(code) = ?;", (str(code_or_id).strip().upper(),))
+                return cursor.rowcount > 0
+
+        return await self._async_run(_del)
+
+    async def async_mark_coupon_used(self, code: str, order_id: str | None = None) -> bool:
+        """Mark a coupon as used after placing an order."""
+        cleaned = code.strip().upper()
+        def _mark() -> bool:
+            conn = self._get_connection()
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """UPDATE coupons
+                       SET status = 'used',
+                           used_at = datetime('now'),
+                           order_id = ?,
+                           updated_at = datetime('now')
+                       WHERE UPPER(code) = ?;""",
+                    (str(order_id) if order_id else None, cleaned),
+                )
+                return cursor.rowcount > 0
+
+        return await self._async_run(_mark)
 
     async def async_migrate_legacy_data(
         self,

@@ -37,6 +37,8 @@ class FlaschenpostView extends HTMLElement {
     this._showBuyModal = false;
     this._buyConfirmChecked = false;
     this._buyLoading = false;
+    this._coupons = [];
+    this._showCouponModal = false;
     this._actionMessage = null;
     this._nextUpdate = null;
     this._lastUpdated = null;
@@ -82,6 +84,7 @@ class FlaschenpostView extends HTMLElement {
       this._fetchLists(),
       this._fetchCategories(),
       this._fetchCart(),
+      this._fetchCoupons(),
     ]);
     this._updateCartUi();
     this._updateTabsUi();
@@ -129,10 +132,62 @@ class FlaschenpostView extends HTMLElement {
         if (resp.next_update) this._nextUpdate = resp.next_update;
         if (resp.last_updated) this._lastUpdated = resp.last_updated;
         if (resp.update_interval_seconds) this._updateIntervalSeconds = resp.update_interval_seconds;
+        if (resp.active_coupons) this._coupons = resp.active_coupons;
         this._updateCartUi();
       }
     } catch (err) {
       console.warn("Failed to fetch cart:", err);
+    }
+  }
+
+  async _fetchCoupons() {
+    if (!this._hass) return;
+    try {
+      const resp = await this._hass.callWS({ type: "flaschenpost/get_coupons" });
+      if (resp && resp.coupons) {
+        this._coupons = resp.coupons;
+        this._updateCartUi();
+      }
+    } catch (err) {
+      console.warn("Failed to fetch coupons:", err);
+    }
+  }
+
+  async _addCoupon(code, description = "") {
+    if (!this._hass || !code || !code.trim()) return;
+    try {
+      const resp = await this._hass.callWS({
+        type: "flaschenpost/add_coupon",
+        code: code.trim(),
+        description: description.trim(),
+      });
+      if (resp && resp.coupons) {
+        this._coupons = resp.coupons;
+      }
+      this._showToast(`Gutschein '${code.trim().toUpperCase()}' gespeichert! Wird bei nächster Bestellung eingelöst.`);
+      await this._fetchCart();
+      this._updateCartUi();
+      this._updateModalsUi();
+    } catch (err) {
+      this._showToast(`Fehler beim Speichern: ${err.message || err}`, true);
+    }
+  }
+
+  async _deleteCoupon(code) {
+    if (!this._hass || !code) return;
+    try {
+      const resp = await this._hass.callWS({
+        type: "flaschenpost/delete_coupon",
+        code: code,
+      });
+      if (resp && resp.coupons) {
+        this._coupons = resp.coupons;
+      }
+      this._showToast(`Gutschein '${code}' entfernt.`);
+      this._updateCartUi();
+      this._updateModalsUi();
+    } catch (err) {
+      this._showToast(`Fehler beim Löschen: ${err.message || err}`, true);
     }
   }
 
@@ -835,6 +890,11 @@ class FlaschenpostView extends HTMLElement {
       ? `Letztes Update: ${new Date(this._lastUpdated).toLocaleTimeString()} (Klicken für sofortige Aktualisierung)`
       : "Klicken für sofortige Aktualisierung";
 
+    const activeCoupons = (this._coupons || []).filter((c) => c.status === "active");
+    const activeCouponLabel = activeCoupons.length > 0
+      ? `🎟️ Gutschein (${activeCoupons.length})`
+      : "🎟️ Gutschein";
+
     container.innerHTML = `
       <div class="cart-pill" id="btn-manual-refresh" title="${lastUpdateTitle}" style="cursor: pointer; display: flex; align-items: center; gap: 6px; user-select: none;">
         <span id="update-refresh-icon" style="display: inline-block; transition: transform 0.5s ease;">🔄</span>
@@ -852,6 +912,7 @@ class FlaschenpostView extends HTMLElement {
         </div>
       </div>
       <div class="cart-actions">
+        <button class="btn-outline" id="btn-coupon-modal" title="Gutscheincode eingeben">${activeCouponLabel}</button>
         <button class="btn-outline" id="btn-dryrun-cart">🔍 Live Vorschau</button>
         <button class="btn-primary" id="btn-sync-cart">📥 In Warenkorb</button>
         <button class="btn-success" id="btn-buy-modal">⚡ Bestellen</button>
@@ -871,6 +932,14 @@ class FlaschenpostView extends HTMLElement {
     const btnSyncCart = container.querySelector("#btn-sync-cart");
     if (btnSyncCart) {
       btnSyncCart.addEventListener("click", () => this._syncToCart(false));
+    }
+
+    const btnCoupon = container.querySelector("#btn-coupon-modal");
+    if (btnCoupon) {
+      btnCoupon.addEventListener("click", () => {
+        this._showCouponModal = true;
+        this._updateModalsUi();
+      });
     }
 
     const btnBuyModal = container.querySelector("#btn-buy-modal");
@@ -1232,6 +1301,9 @@ class FlaschenpostView extends HTMLElement {
       `;
     }
 
+    const activeCoupons = (this._coupons || []).filter((c) => c.status === "active");
+    const nextCoupon = activeCoupons.length > 0 ? activeCoupons[0] : null;
+
     let buyHtml = "";
     if (this._showBuyModal) {
       buyHtml = `
@@ -1249,6 +1321,11 @@ class FlaschenpostView extends HTMLElement {
               <div style="font-size: 0.9rem; color: #666;">
                 Enthaltene Artikel: ${this._cart && this._cart.items ? this._cart.items.length : 0}
               </div>
+              ${nextCoupon ? `
+                <div style="margin-top: 10px; padding: 8px 12px; background: #e8f5e9; border: 1px solid #c8e6c9; border-radius: 6px; color: #2e7d32; font-size: 0.9rem;">
+                  🎟️ <strong>Gutscheincode:</strong> <code>${nextCoupon.code}</code> (${nextCoupon.description || "Hinterlegter Gutschein"}) wird bei dieser Bestellung eingelöst!
+                </div>
+              ` : ""}
             </div>
 
             <div style="margin: 16px 0;">
@@ -1269,7 +1346,114 @@ class FlaschenpostView extends HTMLElement {
       `;
     }
 
-    container.innerHTML = `${dryRunHtml}${buyHtml}`;
+    let couponHtml = "";
+    if (this._showCouponModal) {
+      const activeList = (this._coupons || []).filter((c) => c.status === "active");
+      const usedList = (this._coupons || []).filter((c) => c.status === "used");
+
+      couponHtml = `
+        <div class="modal-overlay" id="modal-overlay-coupon">
+          <div class="modal-box">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+              <h2 style="margin: 0; font-size: 1.25rem; color: var(--primary-text-color, #212121);">🎟️ Flaschenpost Gutscheincodes</h2>
+              <button class="btn-outline" id="btn-close-coupon">✕</button>
+            </div>
+
+            <p style="font-size: 0.9rem; color: var(--secondary-text-color, #666); margin-top: 0; margin-bottom: 16px;">
+              Gutscheincodes werden in der Datenbank gespeichert und automatisch bei deiner nächsten Flaschenpost-Bestellung eingelöst.
+            </p>
+
+            <div style="display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap;">
+              <input type="text" id="input-coupon-code" placeholder="Gutscheincode (z. B. FLASCHE10)" style="flex: 2; min-width: 160px; padding: 8px 12px; border: 1px solid var(--divider-color, #ddd); border-radius: 6px; font-weight: bold; text-transform: uppercase;" />
+              <input type="text" id="input-coupon-desc" placeholder="Beschreibung (optional)" style="flex: 3; min-width: 160px; padding: 8px 12px; border: 1px solid var(--divider-color, #ddd); border-radius: 6px;" />
+              <button class="btn-primary" id="btn-save-coupon">Hinzufügen</button>
+            </div>
+
+            <div style="font-size: 1rem; font-weight: 600; margin-bottom: 8px;">
+              Aktive Gutscheine (${activeList.length})
+            </div>
+            ${activeList.length === 0 ? `
+              <div style="padding: 12px; background: var(--secondary-background-color, #f9f9f9); border-radius: 6px; color: #888; font-size: 0.9rem; margin-bottom: 16px;">
+                Keine aktiven Gutscheincodes hinterlegt.
+              </div>
+            ` : `
+              <div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; max-height: 25vh; overflow-y: auto;">
+                ${activeList.map((c) => `
+                  <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: #e8f5e9; border: 1px solid #c8e6c9; border-radius: 8px;">
+                    <div>
+                      <strong style="font-family: monospace; font-size: 1.05rem; color: #1b5e20;">${c.code}</strong>
+                      ${c.description ? `<span style="margin-left: 8px; color: #555; font-size: 0.85rem;">— ${c.description}</span>` : ""}
+                      <div style="font-size: 0.75rem; color: #2e7d32; margin-top: 2px;">✓ Aktiv • Wird bei nächster Bestellung eingelöst</div>
+                    </div>
+                    <button class="btn-outline btn-delete-coupon" data-code="${c.code}" style="padding: 4px 8px; color: #c62828;" title="Gutschein entfernen">🗑️</button>
+                  </div>
+                `).join("")}
+              </div>
+            `}
+
+            ${usedList.length > 0 ? `
+              <div style="font-size: 0.9rem; font-weight: 600; margin-bottom: 8px; color: #777;">
+                Bereits eingelöste Gutscheine (${usedList.length})
+              </div>
+              <div style="display: flex; flex-direction: column; gap: 6px; max-height: 15vh; overflow-y: auto;">
+                ${usedList.map((c) => `
+                  <div style="display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: var(--secondary-background-color, #f5f5f5); border-radius: 6px; font-size: 0.85rem; color: #777;">
+                    <div>
+                      <span style="font-family: monospace; text-decoration: line-through;">${c.code}</span>
+                      <span style="margin-left: 8px;">${c.order_id ? `(Bestellung #${c.order_id})` : "(Eingelöst)"}</span>
+                    </div>
+                    <button class="btn-outline btn-delete-coupon" data-code="${c.code}" style="padding: 2px 6px; font-size: 0.75rem;" title="Aus Verlauf entfernen">✕</button>
+                  </div>
+                `).join("")}
+              </div>
+            ` : ""}
+
+            <div style="display: flex; justify-content: flex-end; margin-top: 20px;">
+              <button class="btn-secondary" id="btn-close-coupon-footer">Schließen</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    container.innerHTML = `${dryRunHtml}${buyHtml}${couponHtml}`;
+
+    const btnCloseCoupon = container.querySelector("#btn-close-coupon");
+    const btnCloseCouponFooter = container.querySelector("#btn-close-coupon-footer");
+    if (btnCloseCoupon) {
+      btnCloseCoupon.addEventListener("click", () => {
+        this._showCouponModal = false;
+        this._updateModalsUi();
+      });
+    }
+    if (btnCloseCouponFooter) {
+      btnCloseCouponFooter.addEventListener("click", () => {
+        this._showCouponModal = false;
+        this._updateModalsUi();
+      });
+    }
+
+    const btnSaveCoupon = container.querySelector("#btn-save-coupon");
+    if (btnSaveCoupon) {
+      btnSaveCoupon.addEventListener("click", () => {
+        const codeInput = container.querySelector("#input-coupon-code");
+        const descInput = container.querySelector("#input-coupon-desc");
+        const code = codeInput ? codeInput.value : "";
+        const desc = descInput ? descInput.value : "";
+        if (code && code.trim()) {
+          this._addCoupon(code.trim(), desc ? desc.trim() : "");
+        }
+      });
+    }
+
+    container.querySelectorAll(".btn-delete-coupon").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const code = e.currentTarget.getAttribute("data-code");
+        if (code) {
+          this._deleteCoupon(code);
+        }
+      });
+    });
 
     const btnCloseDryRun = container.querySelector("#btn-close-dryrun");
     if (btnCloseDryRun) {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 import re
@@ -31,6 +32,8 @@ from .const import (
     UNIT_TYPE_VOLUME_ML,
     UNIT_TYPE_WEIGHT_G,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 _INLINE_SORT_TAG_REGEX = re.compile(
     r"\s*\[(?P<tag>[^\]]+)\]\s*",
@@ -615,6 +618,87 @@ class FlaschenpostShoppingListManager:
         }
         self._list_added_callbacks: list[Callable[[str], None]] = []
         self._list_deleted_callbacks: list[Callable[[str], None]] = []
+        self._in_memory_coupons: list[dict[str, Any]] = []
+
+    @property
+    def storage(self) -> Any | None:
+        """Return the underlying SQLite storage instance."""
+        return self._storage
+
+    async def async_get_coupons(self, status: str | None = None) -> list[dict[str, Any]]:
+        """Return coupons from SQLite storage or in-memory fallback."""
+        if self._storage and hasattr(self._storage, "async_get_coupons"):
+            return await self._storage.async_get_coupons(status=status)
+        if status:
+            return [c for c in self._in_memory_coupons if c["status"] == status]
+        return list(self._in_memory_coupons)
+
+    async def async_get_active_coupons(self) -> list[dict[str, Any]]:
+        """Return all active coupons from SQLite storage."""
+        return await self.async_get_coupons(status="active")
+
+    async def async_add_coupon(self, code: str, description: str = "") -> dict[str, Any]:
+        """Add coupon to SQLite storage or in-memory fallback."""
+        if self._storage and hasattr(self._storage, "async_add_coupon"):
+            return await self._storage.async_add_coupon(code=code, description=description)
+        cleaned = code.strip().upper()
+        existing = next((c for c in self._in_memory_coupons if c["code"] == cleaned), None)
+        if existing:
+            existing["status"] = "active"
+            existing["description"] = description.strip() or existing["description"]
+            return existing
+        coupon = {
+            "id": len(self._in_memory_coupons) + 1,
+            "code": cleaned,
+            "description": description.strip(),
+            "status": "active",
+            "used_at": None,
+            "order_id": None,
+            "created_at": "2026-11-05T00:00:00",
+            "updated_at": "2026-11-05T00:00:00",
+        }
+        self._in_memory_coupons.append(coupon)
+        return coupon
+
+    async def async_delete_coupon(self, code_or_id: str | int) -> bool:
+        """Delete coupon from SQLite storage or in-memory fallback."""
+        if self._storage and hasattr(self._storage, "async_delete_coupon"):
+            return await self._storage.async_delete_coupon(code_or_id)
+        before = len(self._in_memory_coupons)
+        if isinstance(code_or_id, int) or (isinstance(code_or_id, str) and str(code_or_id).isdigit()):
+            self._in_memory_coupons = [c for c in self._in_memory_coupons if c["id"] != int(code_or_id)]
+        else:
+            needle = str(code_or_id).strip().upper()
+            self._in_memory_coupons = [c for c in self._in_memory_coupons if c["code"] != needle]
+        return len(self._in_memory_coupons) < before
+
+    async def async_mark_coupon_used(self, code: str, order_id: str | None = None) -> bool:
+        """Mark coupon as used in SQLite storage or in-memory fallback."""
+        if self._storage and hasattr(self._storage, "async_mark_coupon_used"):
+            return await self._storage.async_mark_coupon_used(code=code, order_id=order_id)
+        needle = code.strip().upper()
+        for c in self._in_memory_coupons:
+            if c["code"] == needle:
+                c["status"] = "used"
+                c["order_id"] = str(order_id) if order_id else None
+                return True
+        return False
+
+    async def async_apply_next_coupon_to_cart(self) -> dict[str, Any] | None:
+        """Apply the oldest active coupon from DB to the current cart, if available."""
+        active = await self.async_get_active_coupons()
+        if not active:
+            return None
+        candidate = active[0]
+        code = candidate["code"]
+        try:
+            if hasattr(self._client, "async_add_discount_code"):
+                await self._client.async_add_discount_code(code)
+            _LOGGER.info("Applied active coupon '%s' to cart", code)
+            return candidate
+        except Exception as err:
+            _LOGGER.warning("Could not apply coupon '%s' to cart: %s", code, err)
+            return candidate
 
     @property
     def list_names(self) -> list[str]:

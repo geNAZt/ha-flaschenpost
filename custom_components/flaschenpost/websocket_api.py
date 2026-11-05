@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import asdict, is_dataclass
 from typing import Any
@@ -422,6 +423,11 @@ async def ws_get_cart(
             if getattr(coord, "update_interval", None)
             else 300
         )
+        active_coupons = []
+        if hasattr(coord, "shopping_list") and coord.shopping_list and hasattr(coord.shopping_list, "async_get_active_coupons"):
+            with contextlib.suppress(Exception):
+                active_coupons = await coord.shopping_list.async_get_active_coupons()
+
         connection.send_result(
             msg["id"],
             {
@@ -432,6 +438,7 @@ async def ws_get_cart(
                 "min_order_value_eur": round(min_order, 2),
                 "min_order_reached": min_order_reached,
                 "remaining_to_min_eur": remaining_to_min,
+                "active_coupons": active_coupons,
                 "last_updated": last_updated_iso,
                 "next_update": next_update_iso,
                 "update_interval_seconds": update_interval_sec,
@@ -518,6 +525,11 @@ async def ws_buy_cart(
             or data.get(CONF_IBAN_LAST4)
             or None
         )
+        # Check and apply next active coupon code from DB
+        applied_coupon = None
+        if hasattr(coord, "shopping_list") and coord.shopping_list and hasattr(coord.shopping_list, "async_apply_next_coupon_to_cart"):
+            applied_coupon = await coord.shopping_list.async_apply_next_coupon_to_cart()
+
         order = await coord.client.async_place_order(
             payment_method=payment_method,
             iban_last4=iban_last4,
@@ -525,12 +537,19 @@ async def ws_buy_cart(
             slot_type=msg.get("slot_type"),
             slot_from=msg.get("slot_from"),
         )
+
+        if applied_coupon and hasattr(coord, "shopping_list") and coord.shopping_list:
+            order_ref = str(order.get("id") or order.get("orderNumber") or "")
+            with contextlib.suppress(Exception):
+                await coord.shopping_list.async_mark_coupon_used(applied_coupon["code"], order_ref)
+
         await coord.async_request_refresh()
         connection.send_result(
             msg["id"],
             {
                 "order_id": order.get("id"),
                 "order_number": order.get("orderNumber"),
+                "applied_coupon": applied_coupon["code"] if applied_coupon else None,
             },
         )
     except Exception as err:
@@ -732,6 +751,87 @@ async def ws_refresh(
         connection.send_error(msg["id"], "error", str(err))
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "flaschenpost/get_coupons",
+        vol.Optional("status"): str,
+        vol.Optional("config_entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_get_coupons(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Get all saved coupons from SQLite database."""
+    try:
+        coord = _resolve_coord(hass, msg.get("config_entry_id"))
+        coupons = await coord.shopping_list.async_get_coupons(status=msg.get("status"))
+        connection.send_result(msg["id"], {"coupons": coupons})
+    except Exception as err:
+        _LOGGER.exception("Error in flaschenpost/get_coupons: %s", err)
+        connection.send_error(msg["id"], "error", str(err))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "flaschenpost/add_coupon",
+        vol.Required("code"): str,
+        vol.Optional("description"): str,
+        vol.Optional("config_entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_add_coupon(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Add coupon to database and attempt immediate cart application."""
+    try:
+        coord = _resolve_coord(hass, msg.get("config_entry_id"))
+        code = str(msg["code"]).strip()
+        desc = str(msg.get("description") or "").strip()
+        coupon = await coord.shopping_list.async_add_coupon(code=code, description=desc)
+        try:
+            if hasattr(coord.client, "async_add_discount_code"):
+                await coord.client.async_add_discount_code(code)
+                await coord.async_request_refresh()
+        except Exception as app_err:
+            _LOGGER.debug("Could not immediately apply coupon to cart: %s", app_err)
+        all_coupons = await coord.shopping_list.async_get_coupons()
+        connection.send_result(msg["id"], {"coupon": coupon, "coupons": all_coupons})
+    except Exception as err:
+        _LOGGER.exception("Error in flaschenpost/add_coupon: %s", err)
+        connection.send_error(msg["id"], "error", str(err))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "flaschenpost/delete_coupon",
+        vol.Required("code"): str,
+        vol.Optional("config_entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_delete_coupon(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Delete coupon from database."""
+    try:
+        coord = _resolve_coord(hass, msg.get("config_entry_id"))
+        code = str(msg["code"]).strip()
+        deleted = await coord.shopping_list.async_delete_coupon(code)
+        all_coupons = await coord.shopping_list.async_get_coupons()
+        connection.send_result(msg["id"], {"code": code, "deleted": deleted, "coupons": all_coupons})
+    except Exception as err:
+        _LOGGER.exception("Error in flaschenpost/delete_coupon: %s", err)
+        connection.send_error(msg["id"], "error", str(err))
+
+
 def async_register_websocket_commands(hass: HomeAssistant) -> None:
     """Register all Flaschenpost WebSocket commands."""
     commands = [
@@ -753,6 +853,9 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
         ws_reset_list_weights,
         ws_import_cart_to_list,
         ws_refresh,
+        ws_get_coupons,
+        ws_add_coupon,
+        ws_delete_coupon,
     ]
     for cmd in commands:
         websocket_api.async_register_command(hass, cmd)

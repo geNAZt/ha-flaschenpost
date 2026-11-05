@@ -206,12 +206,15 @@ from custom_components.flaschenpost.shopping_list import (
 from custom_components.flaschenpost.storage import FlaschenpostSqliteStorage
 from custom_components.flaschenpost.websocket_api import (
     async_register_websocket_commands,
+    ws_add_coupon,
     ws_add_item,
     ws_buy_cart,
+    ws_delete_coupon,
     ws_delete_item,
     ws_delete_list,
     ws_get_cart,
     ws_get_categories,
+    ws_get_coupons,
     ws_get_lists,
     ws_get_stored_payment_id,
     ws_import_cart_to_list,
@@ -234,6 +237,7 @@ class _FakeApiClient:
         self.cart_positions_calls: list[list[dict[str, int]]] = []
         self.resolve_calls: list[tuple[str, str | None, str, float]] = []
         self.cleared_cart: bool = False
+        self.applied_discount_codes: list[str] = []
 
     async def async_get_categories(
         self, warehouse_id: int | None = None
@@ -625,6 +629,10 @@ class _FakeApiClient:
                 "label": "Kreditkarte VISA •••• 4242",
             }
         ]
+
+    async def async_add_discount_code(self, code: str) -> dict[str, Any]:
+        self.applied_discount_codes.append(code)
+        return {"id": "cart-123"}
 
     async def async_create_new_cart(self) -> dict[str, Any]:
         self.cleared_cart = True
@@ -1838,7 +1846,7 @@ class TestFlaschenpostHelpers(unittest.TestCase):
 
             # Test command registration
             async_register_websocket_commands(mock_hass)  # type: ignore[arg-type]
-            self.assertEqual(len(registered_cmds), 18)
+            self.assertEqual(len(registered_cmds), 21)
 
             conn = _MockActiveConn()
 
@@ -2088,7 +2096,46 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             self.assertIn("next_update", conn.results[17])
             self.assertEqual(conn.results[17]["update_interval_seconds"], 300)
 
-            # 14. Verify frontend panel JS asset exists and contains web component
+            # 18. ws_add_coupon
+            await ws_add_coupon(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 18,
+                    "type": "flaschenpost/add_coupon",
+                    "code": "FLASCHE10",
+                    "description": "10€ Rabatt",
+                },
+            )
+            self.assertIn(18, conn.results)
+            self.assertEqual(conn.results[18]["coupon"]["code"], "FLASCHE10")
+
+            # 19. ws_get_coupons
+            await ws_get_coupons(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 19,
+                    "type": "flaschenpost/get_coupons",
+                },
+            )
+            self.assertIn(19, conn.results)
+            self.assertTrue(any(c["code"] == "FLASCHE10" for c in conn.results[19]["coupons"]))
+
+            # 20. ws_delete_coupon
+            await ws_delete_coupon(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {
+                    "id": 20,
+                    "type": "flaschenpost/delete_coupon",
+                    "code": "FLASCHE10",
+                },
+            )
+            self.assertIn(20, conn.results)
+            self.assertTrue(conn.results[20]["deleted"])
+
+            # 21. Verify frontend panel JS asset exists and contains web component
             panel_js_file = _PKG_DIR / "frontend" / "flaschenpost-panel.js"
             self.assertTrue(panel_js_file.exists())
             js_content = panel_js_file.read_text(encoding="utf-8")
@@ -2653,6 +2700,63 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             self.assertFalse(res["min_order_reached"])
             self.assertEqual(res["remaining_to_min_eur"], 25.0)
             self.assertEqual(res["items"], [])
+
+        asyncio.run(_run())
+
+
+    def test_coupon_database_and_order_redemption(self) -> None:
+        """Verify coupon codes are stored in SQLite DB, queried, and redeemed on next order."""
+        import tempfile
+
+        async def _run() -> None:
+            fake_client = _FakeApiClient()
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = Path(tmp_dir) / "flaschenpost.db"
+                storage = FlaschenpostSqliteStorage(str(db_path))
+                await storage.async_init()
+
+                # 1. Initially no coupons
+                coupons = await storage.async_get_coupons()
+                self.assertEqual(coupons, [])
+
+                # 2. Add active coupons
+                c1 = await storage.async_add_coupon("FLASCHE10", "10 Euro Willkommensgutschein")
+                self.assertEqual(c1["code"], "FLASCHE10")
+                self.assertEqual(c1["status"], "active")
+                self.assertEqual(c1["description"], "10 Euro Willkommensgutschein")
+
+                c2 = await storage.async_add_coupon("sommer5", "5 Euro Sommeraktion")
+                self.assertEqual(c2["code"], "SOMMER5")  # Uppercased
+
+                all_c = await storage.async_get_coupons()
+                self.assertEqual(len(all_c), 2)
+                active_c = await storage.async_get_active_coupons()
+                self.assertEqual(len(active_c), 2)
+
+                # 3. Manager integration & auto-apply to cart
+                mgr = FlaschenpostShoppingListManager(client=fake_client, storage=storage)
+                applied = await mgr.async_apply_next_coupon_to_cart()
+                self.assertIsNotNone(applied)
+                self.assertEqual(applied["code"], "FLASCHE10")
+                self.assertIn("FLASCHE10", fake_client.applied_discount_codes)
+
+                # 4. Mark coupon used on order completion
+                await storage.async_mark_coupon_used("FLASCHE10", "ord-mock-777")
+                active_after = await storage.async_get_active_coupons()
+                self.assertEqual(len(active_after), 1)
+                self.assertEqual(active_after[0]["code"], "SOMMER5")
+
+                used_c = await storage.async_get_coupons(status="used")
+                self.assertEqual(len(used_c), 1)
+                self.assertEqual(used_c[0]["code"], "FLASCHE10")
+                self.assertEqual(used_c[0]["order_id"], "ord-mock-777")
+                self.assertIsNotNone(used_c[0]["used_at"])
+
+                # 5. Delete coupon
+                del_res = await storage.async_delete_coupon("SOMMER5")
+                self.assertTrue(del_res)
+                active_final = await storage.async_get_active_coupons()
+                self.assertEqual(len(active_final), 0)
 
         asyncio.run(_run())
 
