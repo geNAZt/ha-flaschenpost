@@ -86,10 +86,19 @@ class FlaschenpostSqliteStorage:
                         name TEXT PRIMARY KEY NOT NULL,
                         random_enabled INTEGER NOT NULL DEFAULT 0,
                         random_count INTEGER NOT NULL DEFAULT 1,
+                        consume_on_order INTEGER NOT NULL DEFAULT 0,
+                        consume_action TEXT NOT NULL DEFAULT 'complete',
                         created_at TEXT NOT NULL DEFAULT (datetime('now')),
                         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
                     );"""
                 )
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA table_info(lists);")
+                list_cols = {row["name"] for row in cursor.fetchall()}
+                if "consume_on_order" not in list_cols:
+                    conn.execute("ALTER TABLE lists ADD COLUMN consume_on_order INTEGER NOT NULL DEFAULT 0;")
+                if "consume_action" not in list_cols:
+                    conn.execute("ALTER TABLE lists ADD COLUMN consume_action TEXT NOT NULL DEFAULT 'complete';")
                 conn.execute(
                     """CREATE TABLE IF NOT EXISTS items (
                         uid TEXT PRIMARY KEY NOT NULL,
@@ -167,6 +176,15 @@ class FlaschenpostSqliteStorage:
                     );"""
                 )
                 conn.execute(
+                    """CREATE TABLE IF NOT EXISTS cart_list_items (
+                        list_name TEXT NOT NULL,
+                        item_uid TEXT NOT NULL,
+                        article_id INTEGER,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        PRIMARY KEY (list_name, item_uid)
+                    );"""
+                )
+                conn.execute(
                     """CREATE TABLE IF NOT EXISTS order_list_spends (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         order_id TEXT NOT NULL,
@@ -216,7 +234,7 @@ class FlaschenpostSqliteStorage:
             conn = self._get_connection()
             cursor = conn.cursor()
 
-            cursor.execute("SELECT name, random_enabled, random_count FROM lists ORDER BY rowid ASC;")
+            cursor.execute("SELECT name, random_enabled, random_count, consume_on_order, consume_action FROM lists ORDER BY rowid ASC;")
             configs: dict[str, ShoppingListConfig] = {}
             lists: dict[str, list[ShoppingListItem]] = {}
             for row in cursor.fetchall():
@@ -224,6 +242,8 @@ class FlaschenpostSqliteStorage:
                 configs[lname] = ShoppingListConfig(
                     random_enabled=bool(row["random_enabled"]),
                     random_count=max(1, int(row["random_count"] or 1)),
+                    consume_on_order=bool(row["consume_on_order"]),
+                    consume_action=str(row["consume_action"] or "complete"),
                 )
                 lists[lname] = []
 
@@ -288,13 +308,21 @@ class FlaschenpostSqliteStorage:
                 for lname in existing_names:
                     cfg = configs.get(lname, ShoppingListConfig())
                     conn.execute(
-                        """INSERT INTO lists (name, random_enabled, random_count)
-                        VALUES (?, ?, ?)
+                        """INSERT INTO lists (name, random_enabled, random_count, consume_on_order, consume_action)
+                        VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT(name) DO UPDATE SET
                             random_enabled = excluded.random_enabled,
                             random_count = excluded.random_count,
+                            consume_on_order = excluded.consume_on_order,
+                            consume_action = excluded.consume_action,
                             updated_at = datetime('now');""",
-                        (lname, int(cfg.random_enabled), max(1, int(cfg.random_count))),
+                        (
+                            lname,
+                            int(cfg.random_enabled),
+                            max(1, int(cfg.random_count)),
+                            int(cfg.consume_on_order),
+                            cfg.consume_action,
+                        ),
                     )
 
                 # Remove lists that no longer exist
@@ -610,6 +638,46 @@ class FlaschenpostSqliteStorage:
             conn = self._get_connection()
             with conn:
                 conn.execute("DELETE FROM cart_item_attributions;")
+        await self._async_run(_clear)
+
+    async def async_set_cart_list_items(
+        self, items: list[dict[str, Any]], clear_existing: bool = False
+    ) -> None:
+        """Record which shopping list items (by list_name and item_uid) are in the active cart."""
+        def _set() -> None:
+            conn = self._get_connection()
+            with conn:
+                if clear_existing:
+                    conn.execute("DELETE FROM cart_list_items;")
+                for it in items:
+                    conn.execute(
+                        """INSERT INTO cart_list_items (list_name, item_uid, article_id, created_at)
+                        VALUES (?, ?, ?, datetime('now'))
+                        ON CONFLICT(list_name, item_uid) DO UPDATE SET
+                            article_id = excluded.article_id,
+                            created_at = datetime('now');""",
+                        (str(it["list_name"]), str(it["item_uid"]), it.get("article_id")),
+                    )
+        await self._async_run(_set)
+
+    async def async_get_cart_list_items(self) -> list[dict[str, Any]]:
+        """Return all tracked cart list items as a list of dicts."""
+        def _get() -> list[dict[str, Any]]:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT list_name, item_uid, article_id FROM cart_list_items;")
+            return [
+                {"list_name": row["list_name"], "item_uid": row["item_uid"], "article_id": row["article_id"]}
+                for row in cursor.fetchall()
+            ]
+        return await self._async_run(_get)
+
+    async def async_clear_cart_list_items(self) -> None:
+        """Clear all tracked cart list items."""
+        def _clear() -> None:
+            conn = self._get_connection()
+            with conn:
+                conn.execute("DELETE FROM cart_list_items;")
         await self._async_run(_clear)
 
     async def async_record_order_list_spends(

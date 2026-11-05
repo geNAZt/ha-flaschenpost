@@ -228,6 +228,11 @@
       "sync_shopping_list": {
         "name": "Sync shopping list to cart"
       }
+    },
+    "event": {
+      "list_item_consumed": {
+        "name": "{list_name} item consumed"
+      }
     }
   }
 }

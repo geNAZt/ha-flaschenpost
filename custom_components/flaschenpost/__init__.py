@@ -75,6 +75,7 @@ PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.TODO,
     Platform.BUTTON,
+    Platform.EVENT,
 ]
 
 ALL_SERVICES = (
@@ -359,6 +360,8 @@ def _async_register_services(hass: HomeAssistant) -> None:
             list_name,
             random_enabled=call.data.get("random_enabled"),
             random_count=call.data.get("random_count"),
+            consume_on_order=call.data.get("consume_on_order"),
+            consume_action=call.data.get("consume_action"),
         )
         coord.async_update_listeners()
         return {"list_name": list_name, **cfg.to_dict()}
@@ -759,6 +762,8 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 vol.Required("list_name"): cv.string,
                 vol.Optional("random_enabled"): cv.boolean,
                 vol.Optional("random_count"): cv.positive_int,
+                vol.Optional("consume_on_order"): cv.boolean,
+                vol.Optional("consume_action"): vol.In(["complete", "delete"]),
             }
         ),
         supports_response=SupportsResponse.OPTIONAL,

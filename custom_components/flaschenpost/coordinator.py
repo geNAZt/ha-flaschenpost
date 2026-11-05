@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -59,6 +61,31 @@ class FlaschenpostCoordinator(DataUpdateCoordinator[FlaschenpostSnapshot]):
         self.client = client
         self.shopping_list = shopping_list
         self.last_update_success_time: datetime | None = None
+        self._item_consumed_listeners: list[Callable[[dict[str, Any]], None]] = []
+        if self.shopping_list and hasattr(self.shopping_list, "register_item_consumed_callback"):
+            self.shopping_list.register_item_consumed_callback(self.async_on_item_consumed)
+
+    def async_on_item_consumed(self, event_data: dict[str, Any]) -> None:
+        """Handle shopping list item consumption: fire HA bus event and notify event entities."""
+        if self.hass and hasattr(self.hass, "bus") and hasattr(self.hass.bus, "async_fire"):
+            self.hass.bus.async_fire("flaschenpost_item_consumed", event_data)
+        for listener in list(self._item_consumed_listeners):
+            try:
+                listener(event_data)
+            except Exception as err:
+                _LOGGER.warning("Error in item consumed listener: %s", err)
+
+    def register_item_consumed_listener(
+        self, listener: Callable[[dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        """Register a listener for consumed item events (used by Event entities)."""
+        self._item_consumed_listeners.append(listener)
+
+        def _remove() -> None:
+            if listener in self._item_consumed_listeners:
+                self._item_consumed_listeners.remove(listener)
+
+        return _remove
 
     @property
     def next_update_time(self) -> datetime | None:
@@ -100,6 +127,12 @@ class FlaschenpostCoordinator(DataUpdateCoordinator[FlaschenpostSnapshot]):
             # Persist orders to SQLite for permanent historical and spending reporting
             if self.shopping_list and hasattr(self.shopping_list, "async_record_orders"):
                 await self.shopping_list.async_record_orders(past_orders + active_orders)
+
+            # Attribute spends and consume items for any active orders
+            if active_orders and self.shopping_list and hasattr(self.shopping_list, "async_record_order_attributions"):
+                for ao in active_orders:
+                    with contextlib.suppress(Exception):
+                        await self.shopping_list.async_record_order_attributions(ao)
 
             all_orders: list[dict[str, Any]] = []
             if self.shopping_list and hasattr(self.shopping_list, "async_get_all_recorded_orders"):

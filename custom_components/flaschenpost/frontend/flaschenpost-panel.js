@@ -494,19 +494,28 @@ class FlaschenpostView extends HTMLElement {
     }
   }
 
-  async _saveListConfig(listName, { random_enabled, random_count }) {
+  async _saveListConfig(listName, patch) {
     try {
+      const current = (this._listConfigs && this._listConfigs[listName]) || {
+        random_enabled: false,
+        random_count: 1,
+        consume_on_order: false,
+        consume_action: "complete",
+      };
+      const merged = { ...current, ...patch };
       const resp = await this._hass.callWS({
         type: "flaschenpost/set_list_config",
         name: listName,
-        random_enabled,
-        random_count,
+        random_enabled: merged.random_enabled,
+        random_count: merged.random_count,
+        consume_on_order: merged.consume_on_order,
+        consume_action: merged.consume_action,
       });
       if (!this._listConfigs) this._listConfigs = {};
-      this._listConfigs[listName] = resp.config || { random_enabled, random_count };
+      this._listConfigs[listName] = resp.config || merged;
       this._updateTabsUi();
       this._updateListItemsUi();
-      this._showToast(`Zufallsauswahl für '${listName}' gespeichert!`);
+      this._showToast(`Einstellungen für '${listName}' gespeichert!`);
     } catch (err) {
       this._showToast(`Fehler: ${err.message || err}`, true);
     }
@@ -1029,6 +1038,20 @@ class FlaschenpostView extends HTMLElement {
         await this._resetListWeights(this._activeList);
       });
     }
+
+    const chkConsume = container.querySelector("#chk-consume-on-order");
+    if (chkConsume) {
+      chkConsume.addEventListener("change", async (e) => {
+        await this._saveListConfig(this._activeList, { consume_on_order: e.target.checked });
+      });
+    }
+
+    const selConsumeAction = container.querySelector("#sel-consume-action");
+    if (selConsumeAction) {
+      selConsumeAction.addEventListener("change", async (e) => {
+        await this._saveListConfig(this._activeList, { consume_action: e.target.value });
+      });
+    }
   }
 
   _updateListItemsUi() {
@@ -1042,15 +1065,23 @@ class FlaschenpostView extends HTMLElement {
     const openItems = listItems.filter((it) => !it.completed);
     const completedItems = listItems.filter((it) => it.completed);
 
-    const cfg = (this._listConfigs && this._listConfigs[this._activeList]) || { random_enabled: false, random_count: 1 };
+    const cfg = (this._listConfigs && this._listConfigs[this._activeList]) || {
+      random_enabled: false,
+      random_count: 1,
+      consume_on_order: false,
+      consume_action: "complete",
+    };
 
     if (cardTitleSpan) {
       const rndInfo = cfg.random_enabled ? ` • 🎲 ${cfg.random_count || 1} zufällig` : "";
-      cardTitleSpan.textContent = `📋 ${this._activeList} (${openItems.length} offen, ${completedItems.length} erledigt${rndInfo})`;
+      const consumeInfo = cfg.consume_on_order
+        ? ` • ⚡ Auto-Consume (${cfg.consume_action === "delete" ? "Löschen" : "Erledigt"})`
+        : "";
+      cardTitleSpan.textContent = `📋 ${this._activeList} (${openItems.length} offen, ${completedItems.length} erledigt${rndInfo}${consumeInfo})`;
     }
 
     const configBarHtml = `
-      <div class="list-config-bar">
+      <div class="list-config-bar" style="display:flex; flex-direction:column; gap:8px;">
         <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
           <label style="display:flex; align-items:center; gap:6px; cursor:pointer; font-weight:600; font-size:0.88rem;">
             <input type="checkbox" id="chk-random-enabled" ${cfg.random_enabled ? "checked" : ""} />
@@ -1066,6 +1097,21 @@ class FlaschenpostView extends HTMLElement {
               Gewichtet (${cfg.random_count || 1} aus ${openItems.length})
             </span>
             <button class="btn-outline" id="btn-reset-weights" style="font-size:0.75rem; padding:2px 8px;" title="Alle Artikel-Gewichte auf 1.0 zurücksetzen">↺ Gewichte reset</button>
+          ` : ""}
+        </div>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; border-top:1px dashed var(--divider-color, #e0e0e0); padding-top:6px;">
+          <label style="display:flex; align-items:center; gap:6px; cursor:pointer; font-weight:600; font-size:0.88rem;">
+            <input type="checkbox" id="chk-consume-on-order" ${cfg.consume_on_order ? "checked" : ""} />
+            <span>⚡ Bei Bestellung verbrauchen (Auto-Consume)</span>
+          </label>
+          ${cfg.consume_on_order ? `
+            <div style="display:flex; align-items:center; gap:6px; font-size:0.85rem; margin-left:8px;">
+              <span style="color:var(--secondary-text-color, #666);">Aktion:</span>
+              <select id="sel-consume-action" style="padding:3px 6px; border:1px solid var(--divider-color, #ccc); border-radius:4px; font-size:0.85rem; background:var(--card-background-color, #fff); color:var(--primary-text-color, #333);">
+                <option value="complete" ${cfg.consume_action !== "delete" ? "selected" : ""}>Als erledigt markieren</option>
+                <option value="delete" ${cfg.consume_action === "delete" ? "selected" : ""}>Vollständig löschen</option>
+              </select>
+            </div>
           ` : ""}
         </div>
       </div>

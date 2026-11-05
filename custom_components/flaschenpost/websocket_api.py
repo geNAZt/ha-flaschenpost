@@ -630,6 +630,8 @@ async def ws_get_stored_payment_id(
         vol.Required("name"): str,
         vol.Optional("random_enabled"): bool,
         vol.Optional("random_count"): int,
+        vol.Optional("consume_on_order"): bool,
+        vol.Optional("consume_action"): vol.In(["complete", "delete"]),
         vol.Optional("config_entry_id"): str,
     }
 )
@@ -639,7 +641,7 @@ async def ws_set_list_config(
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Update per-list configuration (e.g. weighted randomizer settings)."""
+    """Update per-list configuration (e.g. weighted randomizer settings and order consumption)."""
     try:
         coord = _resolve_coord(hass, msg.get("config_entry_id"))
         name = str(msg["name"]).strip()
@@ -647,6 +649,8 @@ async def ws_set_list_config(
             name,
             random_enabled=msg.get("random_enabled"),
             random_count=msg.get("random_count"),
+            consume_on_order=msg.get("consume_on_order"),
+            consume_action=msg.get("consume_action"),
         )
         coord.async_update_listeners()
         connection.send_result(msg["id"], {"name": name, "config": cfg.to_dict()})

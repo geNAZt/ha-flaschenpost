@@ -496,15 +496,19 @@ def format_shopping_item_summary(
 
 @dataclass
 class ShoppingListConfig:
-    """Per-list configuration options, such as weighted randomizer settings."""
+    """Per-list configuration options, such as weighted randomizer settings and order consumption."""
 
     random_enabled: bool = False
     random_count: int = 1
+    consume_on_order: bool = False
+    consume_action: str = "complete"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "random_enabled": self.random_enabled,
             "random_count": self.random_count,
+            "consume_on_order": self.consume_on_order,
+            "consume_action": self.consume_action,
         }
 
     @classmethod
@@ -514,6 +518,8 @@ class ShoppingListConfig:
         return cls(
             random_enabled=bool(data.get("random_enabled", False)),
             random_count=max(1, int(data.get("random_count", 1))),
+            consume_on_order=bool(data.get("consume_on_order", False)),
+            consume_action=str(data.get("consume_action", "complete") or "complete"),
         )
 
 @dataclass
@@ -596,6 +602,7 @@ class _MergedRequirement:
     negative_keywords: list[str] = field(default_factory=list)
     source_lists: list[str] = field(default_factory=list)
     source_items: list[ShoppingListItem] = field(default_factory=list)
+    source_items_by_list: list[tuple[str, ShoppingListItem]] = field(default_factory=list)
     list_amounts: dict[str, float] = field(default_factory=dict)
 
 
@@ -624,6 +631,9 @@ class FlaschenpostShoppingListManager:
         self._in_memory_recorded_orders: list[dict[str, Any]] = []
         self._in_memory_cart_attributions: dict[int, dict[str, float]] = {}
         self._in_memory_list_spends: dict[str, list[dict[str, Any]]] = {}
+        self._in_memory_cart_list_items: list[dict[str, Any]] = []
+        self._item_consumed_callbacks: list[Callable[[dict[str, Any]], None]] = []
+        self._consumed_order_ids: set[str] = set()
 
     @property
     def storage(self) -> Any | None:
@@ -747,6 +757,183 @@ class FlaschenpostShoppingListManager:
         if self._storage and hasattr(self._storage, "async_get_cart_attributions"):
             return await self._storage.async_get_cart_attributions()
         return dict(self._in_memory_cart_attributions)
+
+    def register_item_consumed_callback(
+        self, callback: Callable[[dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        """Register a callback invoked when a shopping list item is consumed on order placement."""
+        self._item_consumed_callbacks.append(callback)
+
+        def _remove() -> None:
+            if callback in self._item_consumed_callbacks:
+                self._item_consumed_callbacks.remove(callback)
+
+        return _remove
+
+    async def async_set_cart_list_items(
+        self, items: list[dict[str, Any]], clear_existing: bool = False
+    ) -> None:
+        """Record which shopping list items (by list_name and item_uid) are active in the cart."""
+        if self._storage and hasattr(self._storage, "async_set_cart_list_items"):
+            await self._storage.async_set_cart_list_items(items, clear_existing=clear_existing)
+            return
+        if clear_existing:
+            self._in_memory_cart_list_items.clear()
+        for it in items:
+            existing = next(
+                (
+                    x
+                    for x in self._in_memory_cart_list_items
+                    if x["list_name"] == it["list_name"] and x["item_uid"] == it["item_uid"]
+                ),
+                None,
+            )
+            if existing:
+                existing["article_id"] = it.get("article_id")
+            else:
+                self._in_memory_cart_list_items.append(dict(it))
+
+    async def async_get_cart_list_items(self) -> list[dict[str, Any]]:
+        """Return all tracked cart list items."""
+        if self._storage and hasattr(self._storage, "async_get_cart_list_items"):
+            return await self._storage.async_get_cart_list_items()
+        return list(self._in_memory_cart_list_items)
+
+    async def async_clear_cart_list_items(self) -> None:
+        """Clear all tracked cart list items."""
+        if self._storage and hasattr(self._storage, "async_clear_cart_list_items"):
+            await self._storage.async_clear_cart_list_items()
+        self._in_memory_cart_list_items.clear()
+
+    async def async_consume_order_items(
+        self, order: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Consume items from configured shopping lists when an order is placed."""
+        order_id = str(order.get("id") or order.get("orderNumber") or "")
+        if order_id and order_id in self._consumed_order_ids:
+            return []
+        if order_id:
+            self._consumed_order_ids.add(order_id)
+
+        order_number = str(order.get("orderNumber") or order_id)
+        order_created_at = str(order.get("createdAt") or datetime.now(UTC).isoformat())
+
+        line_items = order.get("lineItems") or []
+        ordered_article_ids: set[int] = set()
+        for li in line_items:
+            sku = (li.get("variant") or {}).get("sku")
+            if sku and str(sku).isdigit():
+                ordered_article_ids.add(int(sku))
+
+        tracked_cart_items = await self.async_get_cart_list_items()
+        consumed_events: list[dict[str, Any]] = []
+        consumed_keys: set[tuple[str, str]] = set()
+        mutated_lists: set[str] = set()
+
+        # Phase 1: Match from tracked cart items
+        for tracked in tracked_cart_items:
+            lname = str(tracked["list_name"])
+            uid = str(tracked["item_uid"])
+            aid = tracked.get("article_id")
+
+            cfg = self.get_list_config(lname)
+            if not cfg.consume_on_order:
+                continue
+
+            if ordered_article_ids and aid is not None and aid not in ordered_article_ids:
+                continue
+
+            target_list = self._lists.get(lname)
+            if not target_list:
+                continue
+
+            item = next((it for it in target_list if it.uid == uid), None)
+            if not item:
+                continue
+
+            action = cfg.consume_action or "complete"
+            if action == "delete":
+                if item in target_list:
+                    target_list.remove(item)
+                    mutated_lists.add(lname)
+            else:
+                if not item.completed:
+                    item.completed = True
+                    mutated_lists.add(lname)
+
+            consumed_keys.add((lname, uid))
+            ev_data = {
+                "list_name": lname,
+                "item_uid": item.uid,
+                "summary": item.summary,
+                "query": item.query,
+                "category": item.category,
+                "unit_type": item.unit_type,
+                "target_amount_base": item.target_amount_base,
+                "quantity": item.quantity,
+                "article_id": item.article_id or aid,
+                "action": action,
+                "order_id": order_id,
+                "order_number": order_number,
+                "order_created_at": order_created_at,
+            }
+            consumed_events.append(ev_data)
+
+        # Phase 2: Fallback for lists with consume_on_order matching by article_id
+        if ordered_article_ids:
+            for lname, items in self._lists.items():
+                cfg = self.get_list_config(lname)
+                if not cfg.consume_on_order:
+                    continue
+                to_remove: list[ShoppingListItem] = []
+                for item in list(items):
+                    if (lname, item.uid) in consumed_keys:
+                        continue
+                    if item.article_id is not None and item.article_id in ordered_article_ids:
+                        action = cfg.consume_action or "complete"
+                        if action == "delete":
+                            to_remove.append(item)
+                            mutated_lists.add(lname)
+                        else:
+                            if not item.completed:
+                                item.completed = True
+                                mutated_lists.add(lname)
+
+                        consumed_keys.add((lname, item.uid))
+                        ev_data = {
+                            "list_name": lname,
+                            "item_uid": item.uid,
+                            "summary": item.summary,
+                            "query": item.query,
+                            "category": item.category,
+                            "unit_type": item.unit_type,
+                            "target_amount_base": item.target_amount_base,
+                            "quantity": item.quantity,
+                            "article_id": item.article_id,
+                            "action": action,
+                            "order_id": order_id,
+                            "order_number": order_number,
+                            "order_created_at": order_created_at,
+                        }
+                        consumed_events.append(ev_data)
+
+                for item in to_remove:
+                    if item in items:
+                        items.remove(item)
+
+        await self.async_clear_cart_list_items()
+
+        if mutated_lists:
+            await self.async_save()
+
+        for ev in consumed_events:
+            for cb in list(self._item_consumed_callbacks):
+                try:
+                    cb(ev)
+                except Exception as err:
+                    _LOGGER.warning("Error invoking item_consumed callback: %s", err)
+
+        return consumed_events
 
     async def async_clear_cart_attributions(self) -> None:
         """Clear all active cart item attributions."""
@@ -882,6 +1069,9 @@ class FlaschenpostShoppingListManager:
                         "items": [it for it in list_items if it["list_name"] == s["list_name"]],
                     }
                 )
+
+        # Consume shopping list items for lists configured to consume on order
+        await self.async_consume_order_items(order)
 
         await self.async_clear_cart_attributions()
 
@@ -1019,6 +1209,8 @@ class FlaschenpostShoppingListManager:
         *,
         random_enabled: bool | None = None,
         random_count: int | None = None,
+        consume_on_order: bool | None = None,
+        consume_action: str | None = None,
     ) -> ShoppingListConfig:
         """Update and persist configuration for a named shopping list."""
         key = self._ensure_list(list_name)
@@ -1027,6 +1219,10 @@ class FlaschenpostShoppingListManager:
             cfg.random_enabled = bool(random_enabled)
         if random_count is not None:
             cfg.random_count = max(1, int(random_count))
+        if consume_on_order is not None:
+            cfg.consume_on_order = bool(consume_on_order)
+        if consume_action is not None:
+            cfg.consume_action = str(consume_action).lower().strip() or "complete"
         await self.async_save()
         return cfg
 
@@ -1651,6 +1847,7 @@ class FlaschenpostShoppingListManager:
                             negative_keywords=list(item.negative_keywords),
                             source_lists=[internal_key],
                             source_items=[item],
+                            source_items_by_list=[(internal_key, item)],
                             list_amounts={internal_key: item.target_amount_base},
                         )
                     else:
@@ -1661,6 +1858,7 @@ class FlaschenpostShoppingListManager:
                         if internal_key not in req.source_lists:
                             req.source_lists.append(internal_key)
                         req.source_items.append(item)
+                        req.source_items_by_list.append((internal_key, item))
                         req.list_amounts[internal_key] = round(
                             req.list_amounts.get(internal_key, 0.0) + item.target_amount_base, 2
                         )
@@ -1711,6 +1909,7 @@ class FlaschenpostShoppingListManager:
                 cart = await self._client.async_create_new_cart()
                 cart_id = cart.get("id")
                 await self.async_clear_cart_attributions()
+                await self.async_clear_cart_list_items()
             return {
                 "lists_merged": matched_lists,
                 "missing_lists": missing_lists,
@@ -1738,6 +1937,7 @@ class FlaschenpostShoppingListManager:
         unresolved: list[str] = []
         completed_candidates: list[ShoppingListItem] = []
         current_sync_attrs: dict[int, dict[str, float]] = {}
+        cart_items_tracked: list[dict[str, Any]] = []
 
         for req in merged_map.values():
             core_label = (
@@ -1772,6 +1972,15 @@ class FlaschenpostShoppingListManager:
                 alloc_q = round(qty * ratio, 4)
                 current_sync_attrs.setdefault(aid, {})[lname] = (
                     current_sync_attrs.setdefault(aid, {}).get(lname, 0.0) + alloc_q
+                )
+
+            for lname, src_item in req.source_items_by_list:
+                cart_items_tracked.append(
+                    {
+                        "list_name": lname,
+                        "item_uid": src_item.uid,
+                        "article_id": aid,
+                    }
                 )
 
             delivered_str = format_base_amount(
@@ -1821,6 +2030,10 @@ class FlaschenpostShoppingListManager:
             if current_sync_attrs:
                 await self.async_set_cart_attributions(
                     current_sync_attrs, clear_existing=clear_cart_first
+                )
+            if cart_items_tracked:
+                await self.async_set_cart_list_items(
+                    cart_items_tracked, clear_existing=clear_cart_first
                 )
             if mark_completed:
                 for item in completed_candidates:

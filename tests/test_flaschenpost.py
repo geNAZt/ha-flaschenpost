@@ -25,12 +25,14 @@ if "voluptuous" not in sys.modules:
     vol.All = lambda *args: None
     vol.Coerce = lambda t: t
     vol.Range = lambda **kw: None
+    vol.In = lambda *args: None
     sys.modules["voluptuous"] = vol
 
 if "homeassistant" not in sys.modules:
     ha = types.ModuleType("homeassistant")
     ha_core = types.ModuleType("homeassistant.core")
     ha_core.HomeAssistant = object
+    ha_core.callback = lambda fn: fn
     ha_comp = types.ModuleType("homeassistant.components")
     ha_ws = types.ModuleType("homeassistant.components.websocket_api")
 
@@ -123,6 +125,21 @@ if "homeassistant" not in sys.modules:
     ha_comp.button = ha_button
     sys.modules["homeassistant.components.button"] = ha_button
 
+    ha_event = types.ModuleType("homeassistant.components.event")
+    class EventEntity:
+        _attr_event_types: list[str] = []
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._last_event_type: str | None = None
+            self._last_event_attributes: dict[str, Any] | None = None
+        def _trigger_event(self, event_type: str, event_attributes: Any = None) -> None:
+            self._last_event_type = event_type
+            self._last_event_attributes = event_attributes
+        def async_write_ha_state(self) -> None:
+            pass
+    ha_event.EventEntity = EventEntity
+    ha_comp.event = ha_event
+    sys.modules["homeassistant.components.event"] = ha_event
+
     ha_const = types.ModuleType("homeassistant.const")
     ha_const.CURRENCY_EURO = "€"
     sys.modules["homeassistant.const"] = ha_const
@@ -149,7 +166,7 @@ if "custom_components.flaschenpost" not in sys.modules:
     fp_pkg.__path__ = [str(_PKG_DIR)]
     sys.modules.setdefault("custom_components", cc_pkg)
     sys.modules["custom_components.flaschenpost"] = fp_pkg
-    for mod_name in ("const", "api", "shopping_list", "storage", "coordinator", "entity", "sensor", "button", "websocket_api"):
+    for mod_name in ("const", "api", "shopping_list", "storage", "coordinator", "entity", "sensor", "button", "event", "websocket_api"):
         spec = importlib.util.spec_from_file_location(
             f"custom_components.flaschenpost.{mod_name}",
             _PKG_DIR / f"{mod_name}.py",
@@ -193,6 +210,10 @@ from custom_components.flaschenpost.const import (
 from custom_components.flaschenpost.coordinator import (
     FlaschenpostCoordinator,
     FlaschenpostSnapshot,
+)
+from custom_components.flaschenpost.event import (
+    FlaschenpostListItemConsumedEventEntity,
+    async_setup_entry as async_setup_event_entry,
 )
 from custom_components.flaschenpost.sensor import (
     FlaschenpostCartTotalSensor,
@@ -3214,6 +3235,196 @@ class TestFlaschenpostHelpers(unittest.TestCase):
                 list_sensor_names = [getattr(e, "_list_name", None) for e in added_entities]
                 self.assertIn("Weekly Grocery", list_sensor_names)
                 self.assertIn("Office Drinks", list_sensor_names)
+
+                storage.close()
+
+        asyncio.run(_run())
+
+    def test_shopping_list_consume_items_on_order_and_event_entity(self) -> None:
+        """Verify consumption of shopping list items upon order placement, both action types, and HA EventEntity updates."""
+        import tempfile
+
+        async def _run() -> None:
+            fake_client = _FakeApiClient()
+            mock_entry = types.SimpleNamespace(entry_id="test_entry", title="Test Account")
+            fired_bus_events: list[tuple[str, dict[str, Any]]] = []
+
+            class MockBus:
+                def async_fire(self, event_name: str, event_data: dict[str, Any]) -> None:
+                    fired_bus_events.append((event_name, event_data))
+
+            mock_hass = types.SimpleNamespace(
+                data={"flaschenpost": {}},
+                bus=MockBus(),
+            )
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = Path(tmp_dir) / "flaschenpost.db"
+                storage = FlaschenpostSqliteStorage(str(db_path))
+                await storage.async_init()
+                mgr = FlaschenpostShoppingListManager(client=fake_client, storage=storage)
+                await mgr.async_load()
+
+                # Configure lists:
+                # ListA: consume_on_order=True, consume_action="complete"
+                # ListB: consume_on_order=True, consume_action="delete"
+                # ListC: consume_on_order=False (default)
+                await mgr.async_set_list_config(
+                    "ListA", consume_on_order=True, consume_action="complete"
+                )
+                await mgr.async_set_list_config(
+                    "ListB", consume_on_order=True, consume_action="delete"
+                )
+                await mgr.async_set_list_config(
+                    "ListC", consume_on_order=False
+                )
+
+                # Add items
+                # ListA item: 1x Heidelbeeren (article 29010)
+                item_a = await mgr.async_add_item("1x Heidelbeeren", list_name="ListA")
+                # ListB item: 1x Joghurt (article 28435)
+                item_b = await mgr.async_add_item("1x Joghurt", list_name="ListB")
+                # ListC item: 1 Kiste Pepsi Zero (article 1838)
+                item_c = await mgr.async_add_item("1 Kiste Pepsi Zero", list_name="ListC")
+
+                # Sync lists to cart
+                sync_res = await mgr.async_add_lists_to_cart(
+                    list_names=["ListA", "ListB", "ListC"],
+                    clear_cart_first=True,
+                )
+                self.assertEqual(sync_res["synced_count"], 3)
+
+                # Check cart_list_items was stored
+                cart_items = await storage.async_get_cart_list_items()
+                self.assertEqual(len(cart_items), 3)
+                tracked_uids = {it["item_uid"] for it in cart_items}
+                self.assertIn(item_a.uid, tracked_uids)
+                self.assertIn(item_b.uid, tracked_uids)
+                self.assertIn(item_c.uid, tracked_uids)
+
+                # Setup coordinator and event entities
+                coord = FlaschenpostCoordinator(
+                    hass=mock_hass,  # type: ignore[arg-type]
+                    entry=mock_entry,  # type: ignore[arg-type]
+                    client=fake_client,  # type: ignore[arg-type]
+                    shopping_list=mgr,
+                )
+                mock_hass.data["flaschenpost"]["test_entry"] = coord
+
+                event_entities: list[FlaschenpostListItemConsumedEventEntity] = []
+                await async_setup_event_entry(
+                    mock_hass,  # type: ignore[arg-type]
+                    mock_entry,  # type: ignore[arg-type]
+                    lambda entities: event_entities.extend(entities),
+                )
+                self.assertEqual(len(event_entities), 4)  # Default + ListA + ListB + ListC
+                for ee in event_entities:
+                    await ee.async_added_to_hass()
+
+                entity_by_list = {ee._list_name: ee for ee in event_entities}
+                self.assertIn("ListA", entity_by_list)
+                self.assertIn("ListB", entity_by_list)
+                self.assertIn("ListC", entity_by_list)
+
+                # Simulate order placement with all 3 articles
+                order_placed = {
+                    "id": "ord-consume-101",
+                    "orderNumber": "ORD-101",
+                    "createdAt": "2026-11-04T12:00:00Z",
+                    "totalPrice": {"centAmount": 2000},
+                    "custom": {
+                        "fields": {
+                            "TotalGoods": {"centAmount": 2000},
+                            "OfficialStatusIconState": "ready_for_delivery",
+                        }
+                    },
+                    "orderState": "Open",
+                    "lineItems": [
+                        {
+                            "id": "li-a",
+                            "variant": {"sku": "29010"},
+                            "name": {"de-DE": "K-Classic Heidelbeeren"},
+                            "quantity": 1,
+                            "totalPrice": {"centAmount": 229},
+                        },
+                        {
+                            "id": "li-b",
+                            "variant": {"sku": "28435"},
+                            "name": {"de-DE": "Landliebe Joghurt"},
+                            "quantity": 1,
+                            "totalPrice": {"centAmount": 79},
+                        },
+                        {
+                            "id": "li-c",
+                            "variant": {"sku": "1838"},
+                            "name": {"de-DE": "Pepsi Zero Kiste"},
+                            "quantity": 1,
+                            "totalPrice": {"centAmount": 1599},
+                        },
+                    ],
+                }
+
+                # Record attributions (which triggers consumption)
+                await mgr.async_record_order_attributions(order_placed)
+
+                # Verify ListA: item was completed
+                items_a = mgr.get_list_items("ListA")
+                self.assertEqual(len(items_a), 1)
+                self.assertTrue(items_a[0].completed)
+
+                # Verify ListB: item was deleted
+                items_b = mgr.get_list_items("ListB")
+                self.assertEqual(len(items_b), 0)
+
+                # Verify ListC: consume_on_order=False, item remains uncompleted
+                items_c = mgr.get_list_items("ListC")
+                self.assertEqual(len(items_c), 1)
+                self.assertFalse(items_c[0].completed)
+
+                # Verify bus events fired: exactly 2 events (for ListA and ListB, but NOT ListC)
+                self.assertEqual(len(fired_bus_events), 2)
+                self.assertEqual(fired_bus_events[0][0], "flaschenpost_item_consumed")
+                ev_a = fired_bus_events[0][1]
+                self.assertEqual(ev_a["list_name"], "ListA")
+                self.assertEqual(ev_a["item_uid"], item_a.uid)
+                self.assertEqual(ev_a["action"], "complete")
+                self.assertEqual(ev_a["order_id"], "ord-consume-101")
+                self.assertEqual(ev_a["order_number"], "ORD-101")
+
+                self.assertEqual(fired_bus_events[1][0], "flaschenpost_item_consumed")
+                ev_b = fired_bus_events[1][1]
+                self.assertEqual(ev_b["list_name"], "ListB")
+                self.assertEqual(ev_b["item_uid"], item_b.uid)
+                self.assertEqual(ev_b["action"], "delete")
+                self.assertEqual(ev_b["order_id"], "ord-consume-101")
+                self.assertEqual(ev_b["order_number"], "ORD-101")
+
+                # Verify Event entities triggered
+                ee_a = entity_by_list["ListA"]
+                self.assertEqual(ee_a._last_event_type, "item_consumed")
+                self.assertEqual(ee_a._last_event_attributes["item_uid"], item_a.uid)
+                self.assertEqual(ee_a._last_event_attributes["action"], "complete")
+
+                ee_b = entity_by_list["ListB"]
+                self.assertEqual(ee_b._last_event_type, "item_consumed")
+                self.assertEqual(ee_b._last_event_attributes["item_uid"], item_b.uid)
+                self.assertEqual(ee_b._last_event_attributes["action"], "delete")
+
+                ee_c = entity_by_list["ListC"]
+                self.assertIsNone(getattr(ee_c, "_last_event_type", None))
+
+                # Verify cart_list_items was cleared in storage
+                cleared_cart_items = await storage.async_get_cart_list_items()
+                self.assertEqual(len(cleared_cart_items), 0)
+
+                # Verify idempotence: calling again for same order does not re-consume
+                fired_count_before = len(fired_bus_events)
+                second_res = await mgr.async_consume_order_items(order_placed)
+                self.assertEqual(len(second_res), 0)
+                self.assertEqual(len(fired_bus_events), fired_count_before)
+
+                for ee in event_entities:
+                    await ee.async_will_remove_from_hass()
 
                 storage.close()
 

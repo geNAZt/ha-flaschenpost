@@ -237,6 +237,11 @@
       "refresh": {
         "name": "Refresh data"
       }
+    },
+    "event": {
+      "list_item_consumed": {
+        "name": "{list_name} item consumed"
+      }
     }
   }
 }

@@ -465,8 +465,8 @@ import_cart_to_list:
           integration: flaschenpost
 
 set_shopping_list_config:
-  name: Configure shopping list randomizer
-  description: Configure weighted random selection settings for a named shopping list.
+  name: Configure shopping list options
+  description: Configure weighted random selection and order consumption settings for a named shopping list.
   fields:
     list_name:
       name: Shopping list name
@@ -488,6 +488,22 @@ set_shopping_list_config:
         number:
           min: 1
           max: 100
+    consume_on_order:
+      name: Consume on order
+      description: Consume items from this list when an order is placed.
+      selector:
+        boolean:
+    consume_action:
+      name: Consumption action
+      description: Action to take on items when an order is placed (complete or delete).
+      default: "complete"
+      selector:
+        select:
+          options:
+            - label: "Complete item"
+              value: "complete"
+            - label: "Delete item"
+              value: "delete"
     config_entry_id:
       name: Account config entry ID
       selector:
