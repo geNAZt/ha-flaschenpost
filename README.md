@@ -95,6 +95,10 @@ data:
     - "{{ 'Every even week' if (now().isocalendar()[1] % 2 == 0) else 'Every odd week' }}"
 ```
 
+## Automation Examples
+
+- **[Bring! <-> Flaschenpost Bi-Directional Sync](./example/bring_sync/README.md)**: Automatically sync items from a Bring! to-do list into a Flaschenpost shopping list, and automatically mark them as completed in Bring! when the Flaschenpost order is placed.
+
 ## Installation via HACS
 
 1. Open **HACS** in Home Assistant -> **Integrations** -> top-right menu -> **Custom repositories**.

@@ -1,0 +1,56 @@
+# ==============================================================================
+# Flaschenpost <-> Bring To-Do List Bi-Directional Synchronization
+# ==============================================================================
+# Replace 'todo.bring_einkaufsliste' with your actual Bring To-Do entity ID.
+# ==============================================================================
+
+# 1. Sync Bring open items into Flaschenpost 'Bring' list
+- id: bring_sync_open_items_to_flaschenpost
+  alias: "Bring: Sync open items to Flaschenpost"
+  description: "Syncs open items from the Bring to-do list into the Flaschenpost Bring shopping list"
+  trigger:
+    - trigger: state
+      entity_id: todo.bring_einkaufsliste
+      not_to:
+        - unavailable
+        - unknown
+  condition: []
+  action:
+    # 1. Fetch all currently open (needs_action) items from Bring
+    - action: todo.get_items
+      target:
+        entity_id: todo.bring_einkaufsliste
+      data:
+        status: needs_action
+      response_variable: bring_list
+
+    # 2. Mirror them into the Flaschenpost 'Bring' shopping list
+    - action: flaschenpost.save_shopping_list
+      data:
+        name: "Bring"
+        replace: true
+        items: >
+          {{ bring_list['todo.bring_einkaufsliste']['items'] | map(attribute='summary') | list }}
+  mode: restart
+
+# 2. Mark item complete in Bring when ordered on Flaschenpost
+- id: flaschenpost_mark_bring_item_complete_on_order
+  alias: "Flaschenpost: Mark Bring item complete on order"
+  description: "Marks bought items as completed in the Bring to-do list when an order is placed"
+  trigger:
+    - trigger: state
+      entity_id: event.flaschenpost_bring_item_consumed
+      not_to:
+        - unavailable
+        - unknown
+  condition: []
+  action:
+    - action: todo.update_item
+      target:
+        entity_id: todo.bring_einkaufsliste
+      data:
+        # 'query' contains the product name stripped of counts, units, and tags (e.g. 'Milch' from '2x Milch')
+        item: "{{ state_attr('event.flaschenpost_bring_item_consumed', 'query') }}"
+        status: completed
+  mode: queued
+  max: 50
