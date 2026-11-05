@@ -193,10 +193,14 @@ from custom_components.flaschenpost.api import (
 )
 from custom_components.flaschenpost.button import FlaschenpostRefreshButton
 from custom_components.flaschenpost.const import (
+    CONF_DEFAULT_PAYMENT,
     CONF_DELIVERY_LOCATION,
+    CONF_IBAN_LAST4,
+    CONF_STORED_PAYMENT_ID,
     CONF_WAREHOUSE_ID,
     DEFAULT_SHOPPING_LIST_NAME,
     PAYMENT_CREDIT_CARD,
+    PAYMENT_PAYPAL,
     PAYMENT_SEPA,
     SERVICE_GET_PAYMENT_METHODS,
     SERVICE_GET_STORED_PAYMENT_ID,
@@ -210,6 +214,7 @@ from custom_components.flaschenpost.const import (
 from custom_components.flaschenpost.coordinator import (
     FlaschenpostCoordinator,
     FlaschenpostSnapshot,
+    async_resolve_payment_parameters,
 )
 from custom_components.flaschenpost.event import (
     FlaschenpostListItemConsumedEventEntity,
@@ -1472,6 +1477,150 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             self.assertTrue(any("adyen/init" in u for u in url_seq))
             self.assertTrue(any("checkout/init" in u for u in url_seq))
             self.assertTrue(any("checkout/complete" in u for u in url_seq))
+
+        asyncio.run(_run())
+
+    def test_place_order_payment_resolution_without_explicit_method(self) -> None:
+        """Verify calling place_order without explicit payment_method queries config and saved methods."""
+        async def _run() -> None:
+            # 1. Config entry options has CONF_DEFAULT_PAYMENT and CONF_STORED_PAYMENT_ID
+            class _FakeEntry1:
+                options = {
+                    CONF_DEFAULT_PAYMENT: PAYMENT_PAYPAL,
+                    CONF_STORED_PAYMENT_ID: "paypal-user@example.com",
+                    CONF_IBAN_LAST4: "",
+                }
+                data = {}
+
+            class _FakeCoord1:
+                config_entry = _FakeEntry1()
+                client = None
+
+            m, s, i = await async_resolve_payment_parameters(_FakeCoord1())
+            self.assertEqual(m, PAYMENT_PAYPAL)
+            self.assertEqual(s, "paypal-user@example.com")
+
+            # 2. Config entry data has CONF_DEFAULT_PAYMENT and CONF_STORED_PAYMENT_ID (empty options)
+            class _FakeEntry2:
+                options = {}
+                data = {
+                    CONF_DEFAULT_PAYMENT: PAYMENT_CREDIT_CARD,
+                    CONF_STORED_PAYMENT_ID: "card-stored-456",
+                }
+
+            class _FakeCoord2:
+                config_entry = _FakeEntry2()
+                client = None
+
+            m, s, i = await async_resolve_payment_parameters(_FakeCoord2())
+            self.assertEqual(m, PAYMENT_CREDIT_CARD)
+            self.assertEqual(s, "card-stored-456")
+
+            # 3. Explicit parameter overrides config entry
+            m, s, i = await async_resolve_payment_parameters(
+                _FakeCoord2(), payment_method=PAYMENT_SEPA, iban_last4="9876"
+            )
+            self.assertEqual(m, PAYMENT_SEPA)
+            self.assertEqual(i, "9876")
+
+            # 4. Neither config nor explicit, but client has saved payment methods -> dynamically queries client
+            class _FakeClientWithSaved:
+                async def async_get_saved_payment_methods(self):
+                    return [
+                        {
+                            "id": "credit_card:sp-primary-card",
+                            "payment_method": PAYMENT_CREDIT_CARD,
+                            "stored_payment_id": "sp-primary-card",
+                            "brand": "mastercard",
+                        }
+                    ]
+
+            class _FakeEntry3:
+                options = {}
+                data = {}
+
+            class _FakeCoord3:
+                config_entry = _FakeEntry3()
+                client = _FakeClientWithSaved()
+
+            m, s, i = await async_resolve_payment_parameters(_FakeCoord3())
+            self.assertEqual(m, PAYMENT_CREDIT_CARD)
+            self.assertEqual(s, "sp-primary-card")
+
+            # 5. Neither config, explicit, nor saved methods on client -> defaults to credit_card, NEVER sepa
+            class _FakeClientNoSaved:
+                async def async_get_saved_payment_methods(self):
+                    return []
+
+            class _FakeCoord4:
+                config_entry = _FakeEntry3()
+                client = _FakeClientNoSaved()
+
+            m, s, i = await async_resolve_payment_parameters(_FakeCoord4())
+            self.assertEqual(m, PAYMENT_CREDIT_CARD)
+            self.assertNotEqual(m, PAYMENT_SEPA)
+
+            # 6. Verify FlaschenpostApiClient.async_place_order default without payment_method uses client attributes
+            client = FlaschenpostApiClient(
+                email="test@example.com",
+                password="secret",
+                default_payment_method=PAYMENT_CREDIT_CARD,
+                stored_payment_id="sp-auto-card",
+            )
+            client._cart_id = "cart-uuid"
+            recalc_cart = {
+                "id": "cart-uuid",
+                "lineItems": [{"id": "li-1", "quantity": 1}],
+                "totalPrice": {"centAmount": 3000},
+                "shippingAddress": {"key": "k1", "custom": {"fields": {"AddressReference": "ref-1"}}},
+                "shippingCustomFields": {"fields": {"SelectedDeliveryType": "DIRECT"}},
+            }
+            adyen_payments_called = []
+
+            async def _fake_req(method, url, params=None, json_body=None, **kwargs):
+                if "validatestock" in url:
+                    return {}
+                if "adyen/init" in url:
+                    return {
+                        "paymentId": "pay-adyen",
+                        "adyenSessionResponse": {"id": "sess-adyen", "sessionData": "sess-data"},
+                    }
+                if "checkout/init" in url or "checkout/complete" in url:
+                    return {"order": {"id": "ord-auto-99", "orderNumber": "FP-AUTO-99"}}
+                return recalc_cart
+
+            client._request = _fake_req  # type: ignore[assignment]
+            client.async_apply_cart_actions = lambda acts: asyncio.sleep(0, result=recalc_cart)  # type: ignore[assignment]
+
+            class _FakeAdyenResp:
+                def __init__(self, data):
+                    self._data = data
+                async def json(self):
+                    return self._data
+                async def __aenter__(self):
+                    return self
+                async def __aexit__(self, *args):
+                    pass
+
+            class _FakeAdyenSession:
+                def post(self, url, json=None, **kwargs):
+                    if "sessions" in url and "setup" in url:
+                        return _FakeAdyenResp({"storedPaymentMethods": [{"id": "sp-auto-card", "type": "scheme"}]})
+                    if "sessions" in url and "payments" in url:
+                        adyen_payments_called.append(json)
+                        return _FakeAdyenResp({"resultCode": "Authorised"})
+                    return _FakeAdyenResp({})
+
+            client._session = _FakeAdyenSession()  # type: ignore[assignment]
+
+            # Place order WITHOUT passing payment_method
+            order = await client.async_place_order()
+            self.assertEqual(order["orderNumber"], "FP-AUTO-99")
+            self.assertEqual(len(adyen_payments_called), 1)
+            self.assertEqual(
+                adyen_payments_called[0]["paymentMethod"]["storedPaymentMethodId"],
+                "sp-auto-card",
+            )
 
         asyncio.run(_run())
 
