@@ -2,7 +2,7 @@
 
 This example demonstrates how to configure a two-way synchronization between a **Bring!** shopping list (using Home Assistant's official Bring! integration) and **Flaschenpost**:
 
-1. **Bring -> Flaschenpost**: When items are added to your Bring! list, an automation updates a dedicated Flaschenpost shopping list (named `"Bring"`).
+1. **Bring -> Flaschenpost**: When items are added to your Bring! list, an automation updates a dedicated Flaschenpost shopping list (named `"Bring"`), automatically inspecting the Bring item description for amounts and unit suffixes (e.g. `500g`, `1kg`, `1.5l`, or raw numbers like `2`).
 2. **Order Placement & Auto-Consume**: When an order is placed on Flaschenpost, the bought items are automatically deleted from the Flaschenpost shopping list.
 3. **Flaschenpost -> Bring**: The item consumption triggers a Home Assistant Event Entity (`event.flaschenpost_bring_item_consumed`), which automatically marks the bought items as **completed** in your Bring! to-do list.
 
@@ -42,11 +42,18 @@ Copy the contents of [`automations.yaml`](./automations.yaml) into your Home Ass
 
 Make sure to replace `todo.bring_einkaufsliste` with your actual Bring To-Do entity ID.
 
-### Automation 1: Sync open items to Flaschenpost
+### Automation 1: Sync open items to Flaschenpost (with amount parsing)
+
+In Bring!, the item name is stored in `summary` (e.g. `Bananen`, `Milchreis`), while the specification/amount is stored in `description` (e.g. `2`, `500g`, `1.5l`).
+
+This automation parses the `description`:
+- **Raw numbers or counts** (e.g., `"2"`, `"3"`, `"2x"`) are treated as unit quantities and formatted as `2x Bananen`.
+- **Numbers with supported suffixes** (e.g., `"500g"`, `"1kg"`, `"1.5l"`, `"250ml"`) are prepended as `500g Milchreis` or `1.5l Hafermilch`.
+- **Plain text notes or empty descriptions** simply use the item name as `Brot`.
 
 ```yaml
 alias: "Bring: Sync open items to Flaschenpost"
-description: "Syncs open items from the Bring to-do list into the Flaschenpost Bring shopping list"
+description: "Syncs open items from the Bring to-do list into the Flaschenpost Bring shopping list, parsing amounts from description"
 trigger:
   - trigger: state
     entity_id: todo.bring_einkaufsliste
@@ -66,7 +73,27 @@ action:
       name: "Bring"
       replace: true
       items: >
-        {{ bring_list['todo.bring_einkaufsliste']['items'] | map(attribute='summary') | list }}
+        {% set ns = namespace(items=[]) %}
+        {% for it in bring_list['todo.bring_einkaufsliste']['items'] %}
+          {% set desc = (it.description | default('', true)) | trim %}
+          {% set name = it.summary | trim %}
+          {% if desc %}
+            {# Raw number or unit count like '2', '2x', '2 stk' -> unit count (e.g. '2x Bananen') #}
+            {% if desc | regex_match('^\\d+(?:[.,]\\d+)?(?:\\s*(?:x|stk|stück))?$', ignorecase=true) %}
+              {% set num = (desc | regex_findall('\\d+(?:[.,]\\d+)?'))[0] %}
+              {% set line = num ~ 'x ' ~ name %}
+            {# Number with supported unit suffixes (g, kg, l, ml, etc.) -> e.g. '500g Reis', '1.5l Milch' #}
+            {% elif desc | regex_match('^\\d+(?:[.,]\\d+)?\\s*(?:kg|kilo|kilogramm|g|gr|gramm|l|ltr|liter|ml|milliliter|kiste|kisten|flasche|flaschen|pkg|packung|dose|dosen)$', ignorecase=true) %}
+              {% set line = desc ~ ' ' ~ name %}
+            {% else %}
+              {% set line = name %}
+            {% endif %}
+          {% else %}
+            {% set line = name %}
+          {% endif %}
+          {% set ns.items = ns.items + [line] %}
+        {% endfor %}
+        {{ ns.items }}
 mode: restart
 ```
 
@@ -86,7 +113,7 @@ action:
     target:
       entity_id: todo.bring_einkaufsliste
     data:
-      # 'query' extracts the product name without units/counts (e.g. 'Milch' from '2x Milch')
+      # 'query' contains the product name stripped of counts, units, and tags (matching Bring's summary)
       item: "{{ state_attr('event.flaschenpost_bring_item_consumed', 'query') }}"
       status: completed
 mode: queued
