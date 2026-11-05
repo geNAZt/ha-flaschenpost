@@ -191,6 +191,18 @@
       },
       "last_update": {
         "name": "Letztes Update"
+      },
+      "weekly_spent": {
+        "name": "Ausgaben diese Woche"
+      },
+      "monthly_spent": {
+        "name": "Ausgaben diesen Monat"
+      },
+      "yearly_spent": {
+        "name": "Ausgaben dieses Jahr"
+      },
+      "total_spent": {
+        "name": "Ausgaben gesamt"
       }
     },
     "binary_sensor": {

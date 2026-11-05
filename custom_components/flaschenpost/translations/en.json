@@ -191,6 +191,18 @@
       },
       "last_update": {
         "name": "Last update"
+      },
+      "weekly_spent": {
+        "name": "Spent this week"
+      },
+      "monthly_spent": {
+        "name": "Spent this month"
+      },
+      "yearly_spent": {
+        "name": "Spent this year"
+      },
+      "total_spent": {
+        "name": "Total spent"
       }
     },
     "binary_sensor": {

@@ -30,6 +30,7 @@ class FlaschenpostSnapshot:
     tracked_order: dict[str, Any] | None = None
     past_orders: list[dict[str, Any]] = field(default_factory=list)
     past_orders_total: int = 0
+    all_orders: list[dict[str, Any]] = field(default_factory=list)
     slots_response: dict[str, Any] = field(default_factory=dict)
     available_slots: list[dict[str, Any]] = field(default_factory=list)
 
@@ -88,9 +89,28 @@ class FlaschenpostCoordinator(DataUpdateCoordinator[FlaschenpostSnapshot]):
                         )
                         tracked_order = active_orders[0]
 
-            past_resp = await self.client.async_get_past_orders(days=180, offset=0)
-            past_orders = past_resp.get("results") or []
-            past_total = int(past_resp.get("total") or len(past_orders))
+            if hasattr(self.client, "async_get_all_past_orders"):
+                past_orders = await self.client.async_get_all_past_orders(days=365 * 3)
+            else:
+                past_resp = await self.client.async_get_past_orders(days=180, offset=0)
+                past_orders = past_resp.get("results") or []
+            past_total = len(past_orders)
+
+            # Persist orders to SQLite for permanent historical and spending reporting
+            if self.shopping_list and hasattr(self.shopping_list, "async_record_orders"):
+                await self.shopping_list.async_record_orders(past_orders + active_orders)
+
+            all_orders: list[dict[str, Any]] = []
+            if self.shopping_list and hasattr(self.shopping_list, "async_get_all_recorded_orders"):
+                all_orders = await self.shopping_list.async_get_all_recorded_orders()
+
+            if not all_orders:
+                seen = set()
+                for o in active_orders + past_orders:
+                    oid = o.get("id") or o.get("orderNumber")
+                    if oid and oid not in seen:
+                        seen.add(oid)
+                        all_orders.append(o)
 
             slots_resp = await self.client.async_get_delivery_slots(
                 cart=cart, account=account
@@ -115,6 +135,7 @@ class FlaschenpostCoordinator(DataUpdateCoordinator[FlaschenpostSnapshot]):
                 tracked_order=tracked_order,
                 past_orders=past_orders,
                 past_orders_total=past_total,
+                all_orders=all_orders,
                 slots_response=slots_resp,
                 available_slots=available_slots,
             )

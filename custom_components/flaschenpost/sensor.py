@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -29,6 +29,74 @@ def _freshness_attrs(coordinator: FlaschenpostCoordinator) -> dict[str, Any]:
     return {
         "last_updated": last_up.isoformat() if last_up else None,
         "next_update": next_up.isoformat() if next_up else None,
+    }
+
+
+def _filter_and_aggregate_orders(
+    orders: list[dict[str, Any]],
+    since: datetime | None = None,
+) -> dict[str, Any]:
+    """Aggregate total money spent and breakdown for valid (non-cancelled) orders since a given datetime."""
+    valid_orders: list[dict[str, Any]] = []
+    total_eur = 0.0
+    goods_eur = 0.0
+    deposit_eur = 0.0
+    delivery_fee_eur = 0.0
+
+    for o in orders:
+        if not o or not isinstance(o, dict):
+            continue
+
+        # Exclude cancelled orders
+        if o.get("orderState") == "Cancelled":
+            continue
+        c_fields = (o.get("custom") or {}).get("fields") or {}
+        st = str(c_fields.get("OfficialStatusIconState") or "").lower()
+        if st in ("cancelled", "storniert"):
+            continue
+
+        created_str = o.get("createdAt")
+        if not created_str:
+            continue
+
+        dt = dt_util.parse_datetime(str(created_str))
+        if dt is None:
+            continue
+
+        dt_local = dt_util.as_local(dt)
+        if since is not None and dt_local < since:
+            continue
+
+        t_eur = cents_to_eur(o.get("totalPrice"))
+        g_eur = cents_to_eur(c_fields.get("TotalGoods"))
+        d_eur = cents_to_eur(c_fields.get("TotalDeposit"))
+        f_eur = cents_to_eur(c_fields.get("TotalDelivery"))
+
+        total_eur += t_eur
+        goods_eur += g_eur
+        deposit_eur += d_eur
+        delivery_fee_eur += f_eur
+
+        valid_orders.append(
+            {
+                "order_id": o.get("id"),
+                "order_number": o.get("orderNumber"),
+                "created_at": created_str,
+                "total_eur": t_eur,
+            }
+        )
+
+    valid_orders.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+
+    return {
+        "order_count": len(valid_orders),
+        "total_eur": round(total_eur, 2),
+        "goods_eur": round(goods_eur, 2),
+        "deposit_eur": round(deposit_eur, 2),
+        "delivery_fee_eur": round(delivery_fee_eur, 2),
+        "first_order_date": valid_orders[-1]["created_at"] if valid_orders else None,
+        "last_order_date": valid_orders[0]["created_at"] if valid_orders else None,
+        "orders": valid_orders[:15],
     }
 
 
@@ -97,6 +165,10 @@ async def async_setup_entry(
             FlaschenpostNextSlotSensor(coordinator),
             FlaschenpostNextUpdateSensor(coordinator),
             FlaschenpostLastUpdateSensor(coordinator),
+            FlaschenpostWeeklySpentSensor(coordinator),
+            FlaschenpostMonthlySpentSensor(coordinator),
+            FlaschenpostYearlySpentSensor(coordinator),
+            FlaschenpostTotalSpentSensor(coordinator),
         ]
     )
 
@@ -420,3 +492,192 @@ class FlaschenpostLastUpdateSensor(FlaschenpostEntity, SensorEntity):
             ),
             "last_update_status": "success" if coord.last_update_success else "failed",
         }
+
+
+class FlaschenpostWeeklySpentSensor(FlaschenpostEntity, SensorEntity):
+    """Summary sensor for money spent in the current calendar week (EUR)."""
+
+    _attr_translation_key = "weekly_spent"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_native_unit_of_measurement = CURRENCY_EURO
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_icon = "mdi:calendar-week"
+
+    def __init__(self, coordinator: FlaschenpostCoordinator) -> None:
+        super().__init__(coordinator, "weekly_spent")
+
+    def _get_orders(self) -> list[dict[str, Any]]:
+        snap = self.coordinator.data
+        if not snap:
+            return []
+        return snap.all_orders or (snap.past_orders + snap.active_orders)
+
+    def _since_start_of_week(self) -> datetime:
+        now = dt_util.now()
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start_of_day - timedelta(days=now.weekday())
+
+    @property
+    def native_value(self) -> float:
+        orders = self._get_orders()
+        since = self._since_start_of_week()
+        agg = _filter_and_aggregate_orders(orders, since=since)
+        return float(agg["total_eur"])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs = _freshness_attrs(self.coordinator)
+        orders = self._get_orders()
+        since = self._since_start_of_week()
+        agg = _filter_and_aggregate_orders(orders, since=since)
+        attrs.update(
+            {
+                "week_start": since.isoformat(),
+                "order_count": agg["order_count"],
+                "goods_eur": agg["goods_eur"],
+                "deposit_eur": agg["deposit_eur"],
+                "delivery_fee_eur": agg["delivery_fee_eur"],
+                "recent_orders": agg["orders"],
+            }
+        )
+        return attrs
+
+
+class FlaschenpostMonthlySpentSensor(FlaschenpostEntity, SensorEntity):
+    """Summary sensor for money spent in the current calendar month (EUR)."""
+
+    _attr_translation_key = "monthly_spent"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_native_unit_of_measurement = CURRENCY_EURO
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_icon = "mdi:calendar-month"
+
+    def __init__(self, coordinator: FlaschenpostCoordinator) -> None:
+        super().__init__(coordinator, "monthly_spent")
+
+    def _get_orders(self) -> list[dict[str, Any]]:
+        snap = self.coordinator.data
+        if not snap:
+            return []
+        return snap.all_orders or (snap.past_orders + snap.active_orders)
+
+    def _since_start_of_month(self) -> datetime:
+        now = dt_util.now()
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    @property
+    def native_value(self) -> float:
+        orders = self._get_orders()
+        since = self._since_start_of_month()
+        agg = _filter_and_aggregate_orders(orders, since=since)
+        return float(agg["total_eur"])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs = _freshness_attrs(self.coordinator)
+        orders = self._get_orders()
+        since = self._since_start_of_month()
+        agg = _filter_and_aggregate_orders(orders, since=since)
+        attrs.update(
+            {
+                "month_start": since.isoformat(),
+                "order_count": agg["order_count"],
+                "goods_eur": agg["goods_eur"],
+                "deposit_eur": agg["deposit_eur"],
+                "delivery_fee_eur": agg["delivery_fee_eur"],
+                "recent_orders": agg["orders"],
+            }
+        )
+        return attrs
+
+
+class FlaschenpostYearlySpentSensor(FlaschenpostEntity, SensorEntity):
+    """Summary sensor for money spent in the current calendar year (EUR)."""
+
+    _attr_translation_key = "yearly_spent"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_native_unit_of_measurement = CURRENCY_EURO
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_icon = "mdi:calendar-range"
+
+    def __init__(self, coordinator: FlaschenpostCoordinator) -> None:
+        super().__init__(coordinator, "yearly_spent")
+
+    def _get_orders(self) -> list[dict[str, Any]]:
+        snap = self.coordinator.data
+        if not snap:
+            return []
+        return snap.all_orders or (snap.past_orders + snap.active_orders)
+
+    def _since_start_of_year(self) -> datetime:
+        now = dt_util.now()
+        return now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    @property
+    def native_value(self) -> float:
+        orders = self._get_orders()
+        since = self._since_start_of_year()
+        agg = _filter_and_aggregate_orders(orders, since=since)
+        return float(agg["total_eur"])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs = _freshness_attrs(self.coordinator)
+        orders = self._get_orders()
+        since = self._since_start_of_year()
+        agg = _filter_and_aggregate_orders(orders, since=since)
+        attrs.update(
+            {
+                "year_start": since.isoformat(),
+                "order_count": agg["order_count"],
+                "goods_eur": agg["goods_eur"],
+                "deposit_eur": agg["deposit_eur"],
+                "delivery_fee_eur": agg["delivery_fee_eur"],
+                "recent_orders": agg["orders"],
+            }
+        )
+        return attrs
+
+
+class FlaschenpostTotalSpentSensor(FlaschenpostEntity, SensorEntity):
+    """Non-resetting all-time total money spent sensor (EUR)."""
+
+    _attr_translation_key = "total_spent"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_native_unit_of_measurement = CURRENCY_EURO
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_icon = "mdi:cash-multiple"
+
+    def __init__(self, coordinator: FlaschenpostCoordinator) -> None:
+        super().__init__(coordinator, "total_spent")
+
+    def _get_orders(self) -> list[dict[str, Any]]:
+        snap = self.coordinator.data
+        if not snap:
+            return []
+        return snap.all_orders or (snap.past_orders + snap.active_orders)
+
+    @property
+    def native_value(self) -> float:
+        orders = self._get_orders()
+        agg = _filter_and_aggregate_orders(orders, since=None)
+        return float(agg["total_eur"])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs = _freshness_attrs(self.coordinator)
+        orders = self._get_orders()
+        agg = _filter_and_aggregate_orders(orders, since=None)
+        attrs.update(
+            {
+                "order_count": agg["order_count"],
+                "goods_eur": agg["goods_eur"],
+                "deposit_eur": agg["deposit_eur"],
+                "delivery_fee_eur": agg["delivery_fee_eur"],
+                "first_order_date": agg["first_order_date"],
+                "last_order_date": agg["last_order_date"],
+                "recent_orders": agg["orders"],
+            }
+        )
+        return attrs
+

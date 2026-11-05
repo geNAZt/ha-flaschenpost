@@ -50,10 +50,19 @@ if "homeassistant" not in sys.modules:
     sys.modules["homeassistant.components"] = ha_comp
     sys.modules["homeassistant.components.websocket_api"] = ha_ws
 
+    def _mock_parse_dt(s: str | None) -> datetime | None:
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+
     ha_util = types.ModuleType("homeassistant.util")
     ha_dt = types.ModuleType("homeassistant.util.dt")
     ha_dt.utcnow = lambda: datetime(2026, 11, 4, 14, 0, 0, tzinfo=UTC)
-    ha_dt.parse_datetime = lambda s: datetime.fromisoformat(s) if s else None
+    ha_dt.now = lambda: datetime(2026, 11, 4, 14, 0, 0, tzinfo=UTC)
+    ha_dt.parse_datetime = _mock_parse_dt
+    ha_dt.as_local = lambda dt: dt if dt.tzinfo else dt.replace(tzinfo=UTC)
     ha_util.dt = ha_dt
     sys.modules["homeassistant.util"] = ha_util
     sys.modules["homeassistant.util.dt"] = ha_dt
@@ -188,7 +197,11 @@ from custom_components.flaschenpost.coordinator import (
 from custom_components.flaschenpost.sensor import (
     FlaschenpostCartTotalSensor,
     FlaschenpostLastUpdateSensor,
+    FlaschenpostMonthlySpentSensor,
     FlaschenpostNextUpdateSensor,
+    FlaschenpostTotalSpentSensor,
+    FlaschenpostWeeklySpentSensor,
+    FlaschenpostYearlySpentSensor,
 )
 from custom_components.flaschenpost.shopping_list import (
     DEFAULT_ITEM_WEIGHT,
@@ -238,6 +251,20 @@ class _FakeApiClient:
         self.resolve_calls: list[tuple[str, str | None, str, float]] = []
         self.cleared_cart: bool = False
         self.applied_discount_codes: list[str] = []
+        self.past_orders_data: list[dict[str, Any]] = []
+
+    async def async_get_past_orders(
+        self, days: int = 365 * 3, offset: int = 0
+    ) -> dict[str, Any]:
+        return {
+            "results": self.past_orders_data[offset : offset + 20],
+            "total": len(self.past_orders_data),
+        }
+
+    async def async_get_all_past_orders(
+        self, days: int = 365 * 3
+    ) -> list[dict[str, Any]]:
+        return list(self.past_orders_data)
 
     async def async_get_categories(
         self, warehouse_id: int | None = None
@@ -2760,6 +2787,211 @@ class TestFlaschenpostHelpers(unittest.TestCase):
 
         asyncio.run(_run())
 
+
+    def test_spending_summary_sensors(self) -> None:
+        """Verify weekly, monthly, yearly, and total spent summary sensors and SQLite order persistence."""
+        import tempfile
+
+        async def _run() -> None:
+            fake_client = _FakeApiClient()
+            mock_entry = types.SimpleNamespace(entry_id="test_entry", title="Test Account")
+            mock_hass = types.SimpleNamespace(data={})
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = Path(tmp_dir) / "flaschenpost.db"
+                storage = FlaschenpostSqliteStorage(str(db_path))
+                await storage.async_init()
+                mgr = FlaschenpostShoppingListManager(client=fake_client, storage=storage)
+
+                coord = FlaschenpostCoordinator(
+                    hass=mock_hass,  # type: ignore[arg-type]
+                    entry=mock_entry,  # type: ignore[arg-type]
+                    client=fake_client,  # type: ignore[arg-type]
+                    shopping_list=mgr,
+                )
+
+                # Reference "now": 2026-11-04T14:00:00Z (Wednesday)
+                # Week start: 2026-11-02T00:00:00Z (Monday)
+                # Month start: 2026-11-01T00:00:00Z (Sunday)
+                # Year start: 2026-01-01T00:00:00Z
+
+                order_this_week = {
+                    "id": "ord-this-week",
+                    "orderNumber": "1001",
+                    "createdAt": "2026-11-03T12:00:00Z",
+                    "totalPrice": {"centAmount": 4550},
+                    "custom": {
+                        "fields": {
+                            "TotalGoods": {"centAmount": 4000},
+                            "TotalDeposit": {"centAmount": 250},
+                            "TotalDelivery": {"centAmount": 300},
+                            "OfficialStatusIconState": "delivered",
+                        }
+                    },
+                    "orderState": "Complete",
+                }
+                order_earlier_this_month = {
+                    "id": "ord-earlier-month",
+                    "orderNumber": "1002",
+                    "createdAt": "2026-11-01T15:00:00Z",
+                    "totalPrice": {"centAmount": 3000},
+                    "custom": {
+                        "fields": {
+                            "TotalGoods": {"centAmount": 2500},
+                            "TotalDeposit": {"centAmount": 500},
+                            "TotalDelivery": {"centAmount": 0},
+                            "OfficialStatusIconState": "delivered",
+                        }
+                    },
+                    "orderState": "Complete",
+                }
+                order_earlier_this_year = {
+                    "id": "ord-earlier-year",
+                    "orderNumber": "1003",
+                    "createdAt": "2026-06-15T10:00:00Z",
+                    "totalPrice": {"centAmount": 6000},
+                    "custom": {
+                        "fields": {
+                            "TotalGoods": {"centAmount": 5500},
+                            "TotalDeposit": {"centAmount": 500},
+                            "TotalDelivery": {"centAmount": 0},
+                            "OfficialStatusIconState": "delivered",
+                        }
+                    },
+                    "orderState": "Complete",
+                }
+                order_previous_year = {
+                    "id": "ord-prev-year",
+                    "orderNumber": "1004",
+                    "createdAt": "2025-12-20T18:00:00Z",
+                    "totalPrice": {"centAmount": 10000},
+                    "custom": {
+                        "fields": {
+                            "TotalGoods": {"centAmount": 9000},
+                            "TotalDeposit": {"centAmount": 1000},
+                            "TotalDelivery": {"centAmount": 0},
+                            "OfficialStatusIconState": "delivered",
+                        }
+                    },
+                    "orderState": "Complete",
+                }
+                order_cancelled_this_week = {
+                    "id": "ord-cancelled",
+                    "orderNumber": "1005",
+                    "createdAt": "2026-11-03T18:00:00Z",
+                    "totalPrice": {"centAmount": 5000},
+                    "custom": {
+                        "fields": {
+                            "TotalGoods": {"centAmount": 5000},
+                            "TotalDeposit": {"centAmount": 0},
+                            "TotalDelivery": {"centAmount": 0},
+                            "OfficialStatusIconState": "cancelled",
+                        }
+                    },
+                    "orderState": "Cancelled",
+                }
+                order_storniert_this_month = {
+                    "id": "ord-storniert",
+                    "orderNumber": "1006",
+                    "createdAt": "2026-11-01T12:00:00Z",
+                    "totalPrice": {"centAmount": 2500},
+                    "custom": {
+                        "fields": {
+                            "TotalGoods": {"centAmount": 2500},
+                            "TotalDeposit": {"centAmount": 0},
+                            "TotalDelivery": {"centAmount": 0},
+                            "OfficialStatusIconState": "storniert",
+                        }
+                    },
+                    "orderState": "Open",
+                }
+
+                all_test_orders = [
+                    order_this_week,
+                    order_earlier_this_month,
+                    order_earlier_this_year,
+                    order_previous_year,
+                    order_cancelled_this_week,
+                    order_storniert_this_month,
+                ]
+
+                # 1. Test SQLite storage upsert and retrieval
+                await storage.async_record_orders(all_test_orders)
+                recorded = await storage.async_get_all_recorded_orders()
+                self.assertEqual(len(recorded), 6)
+
+                # Test upsert conflict update
+                updated_order = dict(order_this_week)
+                updated_order["orderState"] = "UpdatedState"
+                await storage.async_record_orders([updated_order])
+                recorded_updated = await storage.async_get_all_recorded_orders()
+                self.assertEqual(len(recorded_updated), 6)
+                this_week_in_db = next(o for o in recorded_updated if o["id"] == "ord-this-week")
+                self.assertEqual(this_week_in_db["orderState"], "UpdatedState")
+
+                # Restore original
+                await storage.async_record_orders([order_this_week])
+
+                # 2. Test coordinator snapshot with all_orders populated
+                coord.data = FlaschenpostSnapshot(
+                    past_orders=[order_this_week, order_earlier_this_month],
+                    all_orders=all_test_orders,
+                )
+
+                weekly_sensor = FlaschenpostWeeklySpentSensor(coord)
+                monthly_sensor = FlaschenpostMonthlySpentSensor(coord)
+                yearly_sensor = FlaschenpostYearlySpentSensor(coord)
+                total_sensor = FlaschenpostTotalSpentSensor(coord)
+
+                # Weekly spent: only order_this_week (45.50 EUR)
+                self.assertEqual(weekly_sensor.native_value, 45.50)
+                w_attrs = weekly_sensor.extra_state_attributes
+                self.assertEqual(w_attrs["order_count"], 1)
+                self.assertEqual(w_attrs["goods_eur"], 40.0)
+                self.assertEqual(w_attrs["deposit_eur"], 2.50)
+                self.assertEqual(w_attrs["delivery_fee_eur"], 3.0)
+                self.assertEqual(len(w_attrs["recent_orders"]), 1)
+                self.assertEqual(w_attrs["recent_orders"][0]["order_id"], "ord-this-week")
+
+                # Monthly spent: order_this_week + order_earlier_this_month (45.50 + 30.00 = 75.50 EUR)
+                self.assertEqual(monthly_sensor.native_value, 75.50)
+                m_attrs = monthly_sensor.extra_state_attributes
+                self.assertEqual(m_attrs["order_count"], 2)
+                self.assertEqual(m_attrs["goods_eur"], 65.0)
+                self.assertEqual(m_attrs["deposit_eur"], 7.50)
+                self.assertEqual(m_attrs["delivery_fee_eur"], 3.0)
+                self.assertEqual(len(m_attrs["recent_orders"]), 2)
+
+                # Yearly spent: order_this_week + order_earlier_this_month + order_earlier_this_year (45.50 + 30.00 + 60.00 = 135.50 EUR)
+                self.assertEqual(yearly_sensor.native_value, 135.50)
+                y_attrs = yearly_sensor.extra_state_attributes
+                self.assertEqual(y_attrs["order_count"], 3)
+                self.assertEqual(y_attrs["goods_eur"], 120.0)
+                self.assertEqual(y_attrs["deposit_eur"], 12.50)
+                self.assertEqual(y_attrs["delivery_fee_eur"], 3.0)
+                self.assertEqual(len(y_attrs["recent_orders"]), 3)
+
+                # Total spent: all 4 non-cancelled orders (45.50 + 30.00 + 60.00 + 100.00 = 235.50 EUR)
+                self.assertEqual(total_sensor.native_value, 235.50)
+                t_attrs = total_sensor.extra_state_attributes
+                self.assertEqual(t_attrs["order_count"], 4)
+                self.assertEqual(t_attrs["goods_eur"], 210.0)
+                self.assertEqual(t_attrs["deposit_eur"], 22.50)
+                self.assertEqual(t_attrs["delivery_fee_eur"], 3.0)
+                self.assertEqual(t_attrs["first_order_date"], "2025-12-20T18:00:00Z")
+                self.assertEqual(t_attrs["last_order_date"], "2026-11-03T12:00:00Z")
+                self.assertEqual(len(t_attrs["recent_orders"]), 4)
+
+                # Empty snapshot test
+                coord.data = FlaschenpostSnapshot()
+                self.assertEqual(weekly_sensor.native_value, 0.0)
+                self.assertEqual(monthly_sensor.native_value, 0.0)
+                self.assertEqual(yearly_sensor.native_value, 0.0)
+                self.assertEqual(total_sensor.native_value, 0.0)
+
+                storage.close()
+
+        asyncio.run(_run())
 
 if __name__ == "__main__":
     unittest.main()

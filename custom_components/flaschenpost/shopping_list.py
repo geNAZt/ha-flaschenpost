@@ -619,6 +619,7 @@ class FlaschenpostShoppingListManager:
         self._list_added_callbacks: list[Callable[[str], None]] = []
         self._list_deleted_callbacks: list[Callable[[str], None]] = []
         self._in_memory_coupons: list[dict[str, Any]] = []
+        self._in_memory_recorded_orders: list[dict[str, Any]] = []
 
     @property
     def storage(self) -> Any | None:
@@ -699,6 +700,24 @@ class FlaschenpostShoppingListManager:
         except Exception as err:
             _LOGGER.warning("Could not apply coupon '%s' to cart: %s", code, err)
             return candidate
+
+    async def async_record_orders(self, orders: list[dict[str, Any]]) -> None:
+        """Upsert orders into SQLite storage (or in-memory cache)."""
+        if self._storage and hasattr(self._storage, "async_record_orders"):
+            await self._storage.async_record_orders(orders)
+        else:
+            seen = {o.get("id") or o.get("orderNumber") for o in self._in_memory_recorded_orders}
+            for o in orders:
+                oid = o.get("id") or o.get("orderNumber")
+                if oid and oid not in seen:
+                    seen.add(oid)
+                    self._in_memory_recorded_orders.append(o)
+
+    async def async_get_all_recorded_orders(self) -> list[dict[str, Any]]:
+        """Return all historical orders from SQLite (or in-memory cache)."""
+        if self._storage and hasattr(self._storage, "async_get_all_recorded_orders"):
+            return await self._storage.async_get_all_recorded_orders()
+        return list(self._in_memory_recorded_orders)
 
     @property
     def list_names(self) -> list[str]:

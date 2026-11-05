@@ -75,9 +75,13 @@ class FlaschenpostOrderError(FlaschenpostError):
     """Checkout or ordering validation error."""
 
 
-def cents_to_eur(money: dict[str, Any] | None) -> float:
-    """Convert Commercetools centPrecision money object to EUR float."""
-    if not money or not isinstance(money, dict):
+def cents_to_eur(money: dict[str, Any] | int | float | None) -> float:
+    """Convert Commercetools centPrecision money object or cent integer to EUR float."""
+    if money is None:
+        return 0.0
+    if isinstance(money, (int, float)):
+        return round(float(money) / 100.0, 2)
+    if not isinstance(money, dict):
         return 0.0
     cents = money.get("centAmount", 0)
     digits = money.get("fractionDigits", 2)
@@ -1011,6 +1015,27 @@ class FlaschenpostApiClient:
         return await self._request(
             "GET", f"/api/v2/myaccount/order/history/{frm}/{unt}/{offset}"
         )
+
+    async def async_get_all_past_orders(
+        self, days: int = 365 * 3
+    ) -> list[dict[str, Any]]:
+        """Fetch all historical orders within the last `days` days, paginating if needed."""
+        all_orders: list[dict[str, Any]] = []
+        offset = 0
+        limit_safety = 1000
+
+        while len(all_orders) < limit_safety:
+            resp = await self.async_get_past_orders(days=days, offset=offset)
+            results = resp.get("results") or []
+            if not results:
+                break
+            all_orders.extend(results)
+            total = int(resp.get("total") or len(all_orders))
+            if len(all_orders) >= total or len(results) == 0:
+                break
+            offset = len(all_orders)
+
+        return all_orders
 
     # -------------------------------------------------------------------------
     # Cart & Delivery Slots

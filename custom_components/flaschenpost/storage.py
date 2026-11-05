@@ -139,6 +139,25 @@ class FlaschenpostSqliteStorage:
                     ON coupons(status, created_at);"""
                 )
                 conn.execute(
+                    """CREATE TABLE IF NOT EXISTS orders (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        order_number TEXT,
+                        created_at TEXT NOT NULL,
+                        total_cents INTEGER NOT NULL,
+                        goods_cents INTEGER DEFAULT 0,
+                        deposit_cents INTEGER DEFAULT 0,
+                        delivery_fee_cents INTEGER DEFAULT 0,
+                        status TEXT,
+                        order_state TEXT,
+                        raw_json TEXT,
+                        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    );"""
+                )
+                conn.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_orders_created_at
+                    ON orders(created_at);"""
+                )
+                conn.execute(
                     """INSERT OR IGNORE INTO lists (name, random_enabled, random_count)
                     VALUES (?, 0, 1);""",
                     (DEFAULT_SHOPPING_LIST_NAME,),
@@ -399,6 +418,94 @@ class FlaschenpostSqliteStorage:
                 return cursor.rowcount > 0
 
         return await self._async_run(_mark)
+
+    async def async_record_orders(self, orders: list[dict[str, Any]]) -> None:
+        """Upsert orders into SQLite storage for permanent historical reporting."""
+        if not orders:
+            return
+
+        def _record() -> None:
+            conn = self._get_connection()
+            with conn:
+                for o in orders:
+                    oid = str(o.get("id") or "")
+                    if not oid:
+                        continue
+                    onum = str(o.get("orderNumber") or "")
+                    created = str(o.get("createdAt") or "")
+                    tot = o.get("totalPrice")
+                    tot_cents = (tot.get("centAmount", 0) if isinstance(tot, dict) else int(tot or 0))
+                    cf = (o.get("custom") or {}).get("fields") or {}
+                    tg = cf.get("TotalGoods")
+                    goods_cents = (tg.get("centAmount", 0) if isinstance(tg, dict) else int(tg or 0))
+                    td = cf.get("TotalDeposit")
+                    dep_cents = (td.get("centAmount", 0) if isinstance(td, dict) else int(td or 0))
+                    tfee = cf.get("TotalDelivery")
+                    deliv_cents = (tfee.get("centAmount", 0) if isinstance(tfee, dict) else int(tfee or 0))
+                    status = str(cf.get("OfficialStatusIconState") or "")
+                    ostate = str(o.get("orderState") or "")
+                    raw = json.dumps(o)
+
+                    conn.execute(
+                        """INSERT INTO orders (
+                            id, order_number, created_at, total_cents, goods_cents,
+                            deposit_cents, delivery_fee_cents, status, order_state,
+                            raw_json, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                        ON CONFLICT(id) DO UPDATE SET
+                            order_number = excluded.order_number,
+                            created_at = excluded.created_at,
+                            total_cents = excluded.total_cents,
+                            goods_cents = excluded.goods_cents,
+                            deposit_cents = excluded.deposit_cents,
+                            delivery_fee_cents = excluded.delivery_fee_cents,
+                            status = excluded.status,
+                            order_state = excluded.order_state,
+                            raw_json = excluded.raw_json,
+                            updated_at = datetime('now');""",
+                        (
+                            oid, onum, created, tot_cents, goods_cents,
+                            dep_cents, deliv_cents, status, ostate, raw,
+                        ),
+                    )
+
+        await self._async_run(_record)
+
+    async def async_get_all_recorded_orders(self) -> list[dict[str, Any]]:
+        """Return all historical orders from SQLite ordered by created_at DESC."""
+        def _get() -> list[dict[str, Any]]:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT id, order_number, created_at, total_cents, goods_cents,
+                          deposit_cents, delivery_fee_cents, status, order_state, raw_json
+                   FROM orders
+                   ORDER BY created_at DESC;"""
+            )
+            orders = []
+            for row in cursor.fetchall():
+                try:
+                    data = json.loads(row["raw_json"])
+                except Exception:
+                    data = {
+                        "id": row["id"],
+                        "orderNumber": row["order_number"],
+                        "createdAt": row["created_at"],
+                        "totalPrice": {"centAmount": row["total_cents"]},
+                        "custom": {
+                            "fields": {
+                                "TotalGoods": {"centAmount": row["goods_cents"]},
+                                "TotalDeposit": {"centAmount": row["deposit_cents"]},
+                                "TotalDelivery": {"centAmount": row["delivery_fee_cents"]},
+                                "OfficialStatusIconState": row["status"],
+                            }
+                        },
+                        "orderState": row["order_state"],
+                    }
+                orders.append(data)
+            return orders
+
+        return await self._async_run(_get)
 
     async def async_migrate_legacy_data(
         self,
