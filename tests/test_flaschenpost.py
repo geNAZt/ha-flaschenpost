@@ -1480,6 +1480,178 @@ class TestFlaschenpostHelpers(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_paypal_vault_credit_card_place_order_flow(self) -> None:
+        """Verify credit card order placement using modern Flaschenpost PayPal Vault Card."""
+        async def _run() -> None:
+            client = FlaschenpostApiClient(email="test@example.com", password="secret")
+            client._cart_id = "cart-uuid"
+            recalc_cart = {
+                "id": "cart-uuid",
+                "lineItems": [{"id": "li-1", "quantity": 1}],
+                "totalPrice": {"centAmount": 2500},
+                "shippingAddress": {"key": "addr-1", "custom": {"fields": {"AddressReference": "ref-123"}}},
+                "shippingCustomFields": {"fields": {"SelectedDeliveryType": "DIRECT", "SelectedDeliveryExpiry": "2099-01-01T00:00:00.000Z"}},
+            }
+
+            requests_log: list[tuple[str, str, Any, Any]] = []
+
+            async def _fake_request(method, url, params=None, json_body=None, **kwargs):
+                requests_log.append((method, url, params, json_body))
+                if url == "/webshop-cart-api/api/v4/cart":
+                    return recalc_cart
+                if "validatestock" in url:
+                    return {}
+                if "paypal-card/init" in url:
+                    return {
+                        "paymentId": "pp-card-pid-111",
+                        "paypalCustomerId": "cust-999",
+                        "vaultCards": [
+                            {
+                                "id": "vault-card-888",
+                                "last_digits": "9796",
+                                "brand": "MASTERCARD",
+                                "expiry": "2031-09",
+                            }
+                        ],
+                    }
+                if "/order?cardId=" in url:
+                    return {"id": "pp-order-id-555"}
+                if "/authorize" in url:
+                    return {"state": "Success"}
+                if "checkout/init" in url:
+                    return {"status": "ok"}
+                if "checkout/complete" in url:
+                    return {"order": {"id": "order-ppcard-123", "orderNumber": "FP-PPCARD-123"}}
+                return {}
+
+            client._request = _fake_request  # type: ignore[assignment]
+            client.async_get_cart = lambda: asyncio.sleep(0, result=recalc_cart)  # type: ignore[assignment]
+
+            # 1. Saved payment methods detection
+            saved = await client.async_get_saved_payment_methods()
+            self.assertTrue(any(m["payment_method"] == PAYMENT_CREDIT_CARD and m.get("stored_payment_id") == "vault-card-888" for m in saved))
+
+            # 2. Place order with credit card
+            order = await client.async_place_order(
+                payment_method=PAYMENT_CREDIT_CARD,
+                stored_payment_id="vault-card-888",
+            )
+            self.assertEqual(order["orderNumber"], "FP-PPCARD-123")
+            self.assertEqual(order["id"], "order-ppcard-123")
+
+            # 3. Verify sequence did not call paypal/init
+            url_seq = [r[1] for r in requests_log]
+            self.assertFalse(any("payment/paypal/init" in u for u in url_seq))
+            self.assertTrue(any("paypal-card/init" in u for u in url_seq))
+            self.assertTrue(any("/order?cardId=vault-card-888" in u for u in url_seq))
+            self.assertTrue(any("/authorize" in u for u in url_seq))
+            self.assertTrue(any("checkout/init" in u for u in url_seq))
+            self.assertTrue(any("checkout/complete" in u for u in url_seq))
+
+        asyncio.run(_run())
+
+    def test_3ds_required_flow_event_and_completion(self) -> None:
+        """Verify 3DS event entity trigger, bus fire, polling completion, and complete_3ds_order service."""
+        from custom_components.flaschenpost.event import Flaschenpost3dsRequiredEventEntity
+
+        async def _run() -> None:
+            client = FlaschenpostApiClient(email="test@example.com", password="secret")
+            client._cart_id = "cart-3ds"
+            recalc_cart = {
+                "id": "cart-3ds",
+                "lineItems": [{"id": "li-1", "quantity": 1}],
+                "totalPrice": {"centAmount": 3000},
+                "shippingAddress": {"key": "addr-1", "custom": {"fields": {"AddressReference": "ref-123"}}},
+                "shippingCustomFields": {"fields": {"SelectedDeliveryType": "DIRECT", "SelectedDeliveryExpiry": "2099-01-01T00:00:00.000Z"}},
+            }
+
+            fired_bus_events: list[tuple[str, dict[str, Any]]] = []
+
+            class _MockBus:
+                def async_fire(self, event_type: str, event_data: dict[str, Any]) -> None:
+                    fired_bus_events.append((event_type, event_data))
+
+            mock_hass = types.SimpleNamespace(bus=_MockBus(), data={})
+            mock_entry = types.SimpleNamespace(entry_id="entry-3ds", title="Test Account")
+            coord = FlaschenpostCoordinator(hass=mock_hass, entry=mock_entry, client=client, shopping_list=None)  # type: ignore[arg-type]
+
+            event_entity = Flaschenpost3dsRequiredEventEntity(coord)
+            await event_entity.async_added_to_hass()
+
+            # 1. Trigger coordinator 3DS event directly
+            coord.async_on_3ds_required({
+                "url": "https://www.paypal.com/3ds-verify-link",
+                "order_id": "order-3ds-999",
+                "payment_id": "pay-3ds-888",
+                "cart_id": "cart-3ds",
+                "total_eur": 30.0,
+            })
+
+            # Verify HA bus event was fired
+            self.assertEqual(len(fired_bus_events), 1)
+            self.assertEqual(fired_bus_events[0][0], "flaschenpost_3ds_required")
+            self.assertEqual(fired_bus_events[0][1]["url"], "https://www.paypal.com/3ds-verify-link")
+            self.assertEqual(fired_bus_events[0][1]["order_id"], "order-3ds-999")
+
+            # Verify EventEntity recorded last event
+            self.assertEqual(event_entity._last_event_type, "3ds_required")
+            self.assertEqual(event_entity._last_event_attributes["url"], "https://www.paypal.com/3ds-verify-link")
+
+            # 2. Test async_place_order with 3DS challenge and polling authorization
+            authorize_attempts = 0
+            on_3ds_called = []
+
+            async def _fake_3ds_request(method, url, params=None, json_body=None, **kwargs):
+                nonlocal authorize_attempts
+                if url == "/webshop-cart-api/api/v4/cart":
+                    return recalc_cart
+                if "validatestock" in url:
+                    return {}
+                if "paypal-card/init" in url:
+                    return {
+                        "paymentId": "pay-3ds-888",
+                        "vaultCards": [{"id": "card-vault-1", "brand": "VISA", "last_digits": "1111"}],
+                    }
+                if "/order?cardId=" in url:
+                    return {"id": "order-3ds-999", "redirectUrl": "https://www.paypal.com/3ds-challenge"}
+                if "/authorize" in url:
+                    authorize_attempts += 1
+                    # Succeed on attempt 2
+                    if authorize_attempts >= 2:
+                        return {"state": "Success"}
+                    return {"state": "Pending"}
+                if "checkout/init" in url:
+                    return {}
+                if "checkout/complete" in url:
+                    return {"order": {"id": "final-order-3ds", "orderNumber": "FP-3DS-DONE"}}
+                return {}
+
+            client._request = _fake_3ds_request  # type: ignore[assignment]
+            client.async_get_cart = lambda: asyncio.sleep(0, result=recalc_cart)  # type: ignore[assignment]
+
+            order = await client.async_place_order(
+                payment_method=PAYMENT_CREDIT_CARD,
+                on_3ds_required=lambda d: on_3ds_called.append(d),
+                wait_3ds_timeout_sec=10.0,
+                poll_3ds_interval_sec=0.01,
+            )
+            self.assertEqual(len(on_3ds_called), 1)
+            self.assertEqual(on_3ds_called[0]["url"], "https://www.paypal.com/3ds-challenge")
+            self.assertEqual(order["orderNumber"], "FP-3DS-DONE")
+            self.assertGreaterEqual(authorize_attempts, 2)
+
+            # 3. Test standalone async_complete_3ds_order
+            complete_order = await client.async_complete_3ds_order(
+                payment_id="pay-3ds-888",
+                order_id="order-3ds-999",
+                cart_id="cart-3ds",
+            )
+            self.assertEqual(complete_order["orderNumber"], "FP-3DS-DONE")
+
+            await event_entity.async_will_remove_from_hass()
+
+        asyncio.run(_run())
+
     def test_place_order_payment_resolution_without_explicit_method(self) -> None:
         """Verify calling place_order without explicit payment_method queries config and saved methods."""
         async def _run() -> None:
@@ -3517,11 +3689,12 @@ class TestFlaschenpostHelpers(unittest.TestCase):
                     mock_entry,  # type: ignore[arg-type]
                     lambda entities: event_entities.extend(entities),
                 )
-                self.assertEqual(len(event_entities), 4)  # Default + ListA + ListB + ListC
+                self.assertEqual(len(event_entities), 5)  # 3DS + Default + ListA + ListB + ListC
                 for ee in event_entities:
                     await ee.async_added_to_hass()
 
-                entity_by_list = {ee._list_name: ee for ee in event_entities}
+                consumed_entities = [ee for ee in event_entities if isinstance(ee, FlaschenpostListItemConsumedEventEntity)]
+                entity_by_list = {ee._list_name: ee for ee in consumed_entities}
                 self.assertIn("ListA", entity_by_list)
                 self.assertIn("ListB", entity_by_list)
                 self.assertIn("ListC", entity_by_list)
