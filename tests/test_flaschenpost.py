@@ -2903,6 +2903,57 @@ class TestFlaschenpostHelpers(unittest.TestCase):
             self.assertEqual(res["remaining_to_min_eur"], 25.0)
             self.assertEqual(res["items"], [])
 
+            # 4. ws_get_cart with loaded cart containing Commercetools CentPrecisionMoney dicts
+            class _LoadedCartClient(_FakeApiClient):
+                async def async_get_cart(self) -> dict[str, Any]:
+                    return {
+                        "id": "cart-loaded-ws",
+                        "totalPrice": {"centAmount": 10344, "currencyCode": "EUR", "type": "centPrecision", "fractionDigits": 2},
+                        "shippingInfo": {"price": {"centAmount": 0, "currencyCode": "EUR", "type": "centPrecision", "fractionDigits": 2}},
+                        "custom": {
+                            "fields": {
+                                "TotalGoods": {"centAmount": 9684, "currencyCode": "EUR", "type": "centPrecision", "fractionDigits": 2},
+                                "MinimumOrderValue": None,
+                            }
+                        },
+                        "lineItems": [
+                            {
+                                "variant": {"sku": "28435"},
+                                "product": {"name": {"de": "K-Classic Naturjoghurt 1,5%"}},
+                                "quantity": 5,
+                                "price": {"value": {"centAmount": 89, "fractionDigits": 2}},
+                                "totalPrice": {"centAmount": 445, "fractionDigits": 2},
+                            }
+                        ],
+                    }
+
+            loaded_client = _LoadedCartClient()
+            loaded_coord = FlaschenpostCoordinator(
+                hass=mock_hass,  # type: ignore[arg-type]
+                entry=mock_entry,  # type: ignore[arg-type]
+                client=loaded_client,  # type: ignore[arg-type]
+                shopping_list=FlaschenpostShoppingListManager(client=loaded_client),  # type: ignore[arg-type]
+            )
+            mock_hass.data["flaschenpost"] = {"test_entry": loaded_coord}
+
+            await ws_get_cart(
+                mock_hass,  # type: ignore[arg-type]
+                conn,  # type: ignore[arg-type]
+                {"id": 101, "type": "flaschenpost/get_cart", "config_entry_id": "test_entry"},
+            )
+            self.assertIn(101, conn.results)
+            l_res = conn.results[101]
+            self.assertEqual(l_res["total_eur"], 103.44)
+            self.assertEqual(l_res["shipping_fee_eur"], 0.0)
+            self.assertEqual(l_res["min_order_value_eur"], 25.0)
+            self.assertTrue(l_res["min_order_reached"])
+            self.assertEqual(l_res["remaining_to_min_eur"], 0.0)
+            self.assertEqual(len(l_res["items"]), 1)
+            self.assertEqual(l_res["items"][0]["article_id"], "28435")
+            self.assertEqual(l_res["items"][0]["name"], "K-Classic Naturjoghurt 1,5%")
+            self.assertEqual(l_res["items"][0]["unit_price_eur"], 0.89)
+            self.assertEqual(l_res["items"][0]["total_eur"], 4.45)
+
         asyncio.run(_run())
 
 
